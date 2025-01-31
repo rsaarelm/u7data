@@ -42,9 +42,7 @@ pub fn main() {
         120.0,
     );
 
-
-    let mut loaded =
-        three_d_asset::io::load(&[model_path]).expect("Couldn't load OBJ");
+    let mut loaded = three_d_asset::io::load(&[model_path]).expect("Couldn't load OBJ");
     let mut scene: Scene = loaded.deserialize("obj").expect("Couldn't deserialize OBJ");
 
     scene.children[0].transformation = consts::OBLIQUE_SHEAR;

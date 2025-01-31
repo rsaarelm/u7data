@@ -1,34 +1,200 @@
-#!/usr/bin/env rust-script
-
-//! Ultima 7 Black Gate SHAPES.VGA image extractor.
-//!
-//! * You must have a working [rust-script](https://rust-script.org/) and the
-//! Rust development environment with `rustc` and `cargo` binaries on your
-//! path.
-//!
-//! * Run rust-script u7extract.rs SHAPES.VGA to produce lots of pngs.
-//!
-//! ```cargo
-//! [dependencies]
-//! anyhow = "1"
-//! byteorder = "1"
-//! image = "0.25"
-//! ```
-
 use std::{
+    env,
     fs::File,
-    io::{prelude::*, BufReader, Cursor, SeekFrom},
+    io::{prelude::*, Cursor, SeekFrom},
+    path::Path,
 };
 
-use anyhow::Result;
+const NUM_SHAPES: usize = 1024;
+
+use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use image::{ImageBuffer, Rgba};
+use itertools::Itertools;
 
 type Pixel = Rgba<u8>;
 type Image = ImageBuffer<Pixel, Vec<u8>>;
 
+#[derive(Debug)]
+enum Game {
+    BlackGate,
+    SerpentIsle,
+}
+
+impl Game {
+    fn detect(path: impl AsRef<Path>) -> Option<Game> {
+        let path = path.as_ref();
+        if path.join("SERPENT.COM").exists() {
+            Some(Game::SerpentIsle)
+        } else if path.join("ULTIMA7.COM").exists() {
+            Some(Game::BlackGate)
+        } else {
+            None
+        }
+    }
+
+    /// Supply names for shapes that have empty strings in the game string
+    /// data.
+    fn missing_name(&self, idx: usize) -> Option<&'static str> {
+        match self {
+            Game::BlackGate => match idx {
+                2 => Some("water"),
+                19 => Some("water"),
+                20 => Some("water"),
+                26 => Some("water"),
+                30 => Some("water"),
+                64 => Some("water"),
+                65 => Some("water"),
+                83 => Some("grassy_mud"),
+                110 => Some("muddy_rock"),
+                161 => Some("thatch_roof"),
+                162 => Some("thatch_roof"),
+                397 => Some("death_bolt"),
+                398 => Some("sparkles"),
+                676 => Some("fire_bolt"),
+                731 => Some("lightning"),
+                793 => Some("chasm"),
+                874 => Some("chasm"),
+                _ => None,
+            },
+            Game::SerpentIsle => match idx {
+                2 => Some("water"),
+                19 => Some("water"),
+                20 => Some("water"),
+                26 => Some("water"),
+                30 => Some("water"),
+                64 => Some("water"),
+                65 => Some("water"),
+                75 => Some("chasm"),
+                76 => Some("floor"),
+                77 => Some("chasm"),
+                82 => Some("a_long_fall"),
+                83 => Some("a_long_fall"),
+                84 => Some("fountain"),
+                110 => Some("fountain"),
+                112 => Some("muddy_bank"),
+                209 => Some("widget"),
+                224 => Some("scorch_mark"),
+                334 => Some("carpet"),
+                397 => Some("fire_spell"),
+                398 => Some("sparkles"),
+                479 => Some("claw"),
+                676 => Some("fire_bolt"),
+                731 => Some("lightning"),
+                893 => Some("man"),
+                945 => Some("automaton"),
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct U7Data {
+    pub game: Game,
+    pub shapes: Vec<Vec<Shape>>,
+    pub strings: Vec<String>,
+    pub sprite_dims: Vec<[i32; 3]>,
+}
+
+impl U7Data {
+    fn load(path: impl AsRef<Path>) -> Result<U7Data> {
+        let path = path.as_ref();
+        let Some(game) = Game::detect(path) else {
+            bail!("Could not find Ultima 7 or Serpent Isle in {path:?}");
+        };
+
+        // Extract dimensions in multiples of 8 pixels for the shapes. This
+        // includes data for both tiles and shapes.
+        let mut sprite_dims = Vec::new();
+        {
+            let mut reader = File::open(path.join("STATIC/TFA.DAT"))?;
+            // 24 bit flag sets. See the data structure reference and parse
+            // more of the flags if needed.
+            while let (Ok(f1), Ok(_f2), Ok(f3)) =
+                (reader.read_u8(), reader.read_u8(), reader.read_u8())
+            {
+                let z = (f1 >> 5) & 0x7;
+                let x = (f3 & 0x7) + 1;
+                let y = ((f3 >> 3) & 0x7) + 1;
+                sprite_dims.push([x as i32, y as i32, z as i32]);
+            }
+        }
+
+        // Load game strings.
+        let strings = load_flx(path.join("STATIC/TEXT.FLX"))?;
+        let strings = strings
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        // Palette data has components in 0..64 range, needs to be converted
+        // to 0..256.
+        let palettes = load_flx(path.join("STATIC/PALETTES.FLX"))?;
+        let palette: Vec<Pixel> = palettes[0]
+            .iter()
+            .tuples()
+            .map(|(&r, &g, &b)| {
+                if r < 64 && g < 64 && b < 64 {
+                    Rgba([r * 4, g * 4, b * 4, 255])
+                } else {
+                    // Weird transparent colors?
+                    Rgba([r, g, b, 255])
+                }
+            })
+            .collect();
+
+        let mut shapes = Vec::new();
+        for elt in load_flx(path.join("STATIC/SHAPES.VGA"))?
+            .iter()
+            .take(NUM_SHAPES)
+        {
+            let frames = load_shapes(&mut Cursor::new(elt), &palette)?;
+            shapes.push(frames);
+        }
+
+        Ok(U7Data {
+            game,
+            shapes,
+            strings,
+            sprite_dims,
+        })
+    }
+
+    pub fn shape_name(&self, idx: usize) -> String {
+        if idx < self.strings.len() {
+            if self.strings[idx].is_empty() {
+                if let Some(name) = self.game.missing_name(idx) {
+                    return name.to_string();
+                }
+            } else {
+                // Sanitize.
+                return self.strings[idx]
+                    .chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+            }
+        }
+
+        "unknown".to_owned()
+    }
+}
+
 /// Load contents from a FLX file.
-pub fn load_flx<R: Read + Seek>(reader: &mut R) -> Result<Vec<Vec<u8>>> {
+pub fn load_flx(path: impl AsRef<Path>) -> Result<Vec<Vec<u8>>> {
+    let mut reader = File::open(path.as_ref())?;
+
     // Skip text comment
     reader.seek(SeekFrom::Current(80))?;
 
@@ -63,7 +229,67 @@ pub fn load_flx<R: Read + Seek>(reader: &mut R) -> Result<Vec<Vec<u8>>> {
     Ok(ret)
 }
 
-pub fn load_shapes<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Vec<Image>> {
+#[derive(Clone, Debug)]
+pub enum Shape {
+    Sprite { image: Image, offset: [i32; 2] },
+
+    // Always 8x8.
+    Tile(Image),
+}
+
+impl AsRef<Image> for Shape {
+    fn as_ref(&self) -> &Image {
+        match self {
+            Shape::Sprite { image, .. } => image,
+            Shape::Tile(image) => image,
+        }
+    }
+}
+
+impl Shape {
+    pub fn is_empty(&self) -> bool {
+        self.as_ref()
+            .enumerate_pixels()
+            .all(|(_, _, p)| p.0[3] == 0)
+    }
+
+    /// Draw a bounding box behind the shape based on the dimensions.
+    pub fn decorate(&mut self, dim: [i32; 3]) {
+        if self.is_empty() {
+            return;
+        }
+
+        let Shape::Sprite {
+            ref mut image,
+            offset,
+        } = self
+        else {
+            return;
+        };
+
+        let mut plot = |x: i32, y: i32, color| {
+            let x = x - offset[0];
+            let y = y - offset[1];
+            if x >= 0
+                && x < image.width() as i32
+                && y >= 0
+                && y < image.height() as i32
+                && image.get_pixel(x as u32, y as u32).0[3] == 0
+            {
+                image.put_pixel(x as u32, y as u32, color);
+            }
+        };
+
+        // Solid-color base for footprint.
+        for y in 0..dim[1] * 8 {
+            for x in 0..dim[0] * 8 {
+                plot(-x, -y, Rgba([255, 0, 255, 255]));
+            }
+        }
+    }
+}
+
+pub fn load_shapes<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Vec<Shape>> {
     let size = reader.read_u32::<LittleEndian>()? as usize;
     let input_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(4))?;
@@ -90,13 +316,13 @@ pub fn load_shapes<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<
 
     for offset in offsets {
         reader.seek(SeekFrom::Start(offset))?;
-        ret.push(load_shape(reader, palette)?);
+        ret.push(load_sprite(reader, palette)?);
     }
 
     Ok(ret)
 }
 
-fn load_tile<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Image> {
+fn load_tile<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shape> {
     let mut image = ImageBuffer::new(8, 8);
 
     for y in 0..8 {
@@ -105,10 +331,10 @@ fn load_tile<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Image>
         }
     }
 
-    Ok(image)
+    Ok(Shape::Tile(image))
 }
 
-fn load_shape<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Image> {
+fn load_sprite<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shape> {
     let max_x = reader.read_u16::<LittleEndian>()? as i16 + 1;
     let min_x = -(reader.read_u16::<LittleEndian>()? as i16);
     let min_y = -(reader.read_u16::<LittleEndian>()? as i16);
@@ -168,1317 +394,79 @@ fn load_shape<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Image
         }
     }
 
-    Ok(image)
+    Ok(Shape::Sprite {
+        image,
+        offset: [min_x as i32, min_y as i32],
+    })
 }
 
-fn main() {
-    // Load FLX file from command line.
-    let file = File::open(std::env::args().nth(1).expect("Usage: u7data SHAPES.VGA")).unwrap();
-    let elts = load_flx(&mut BufReader::new(file)).unwrap();
+fn build_sheet(shapes: &[Shape]) -> Image {
+    const COLUMNS: usize = 8;
 
-    eprintln!("Loaded {} flx entries", elts.len());
+    // Determine positions of images and total sheet dimensions.
+    let mut width = 0;
+    let mut height = 0;
+    let mut positions = Vec::new();
+    let mut x = 0;
+    let mut y = 0;
+    for (i, s) in shapes.iter().enumerate() {
+        if i % COLUMNS == 0 {
+            x = 0;
+            y = height;
+        }
 
-    for (i, elt) in elts.iter().enumerate() {
-        let shapes = load_shapes(&mut Cursor::new(elt), &U7_PALETTE).unwrap();
+        let (mut w, mut h) = s.as_ref().dimensions();
 
-        for (j, shape) in shapes.iter().enumerate() {
-            let filename = format!("{}{}-{}.png", SHAPE_NAMES[i], i, j);
-            let is_blank = shape.enumerate_pixels().all(|(_, _, p)| p.0[3] == 0);
-            if is_blank {
-                eprintln!("Skipping blank shape {}", filename);
-                continue;
-            }
+        if matches!(s, Shape::Sprite { .. }) {
+            // It's a sprite, add padding.
+            positions.push((x + 1, y + 1));
+            w += 1;
+            h += 1;
+        } else {
+            // Pack tiles tightly.
+            positions.push((x, y));
+        }
 
-            shape.save(filename).unwrap();
+        width = width.max(x + w);
+        height = height.max(y + h);
+        x += w;
+    }
+
+    let mut result = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 0]));
+
+    for (s, (x, y)) in shapes.iter().zip(positions) {
+        for (sx, sy, p) in s.as_ref().enumerate_pixels() {
+            result.put_pixel(x + sx, y + sy, *p);
         }
     }
+
+    result
 }
 
-// Constructed from the first palette in PALETTES.FLX, components multiplied
-// by 4.
-static U7_PALETTE: [Pixel; 256] = [
-    Rgba([0x00, 0x00, 0x00, 0xff]),
-    Rgba([0xf8, 0xf0, 0xcc, 0xff]),
-    Rgba([0xf4, 0xe4, 0xa4, 0xff]),
-    Rgba([0xf0, 0xdc, 0x78, 0xff]),
-    Rgba([0xec, 0xd0, 0x50, 0xff]),
-    Rgba([0xec, 0xc8, 0x28, 0xff]),
-    Rgba([0xd8, 0xac, 0x20, 0xff]),
-    Rgba([0xc4, 0x94, 0x18, 0xff]),
-    Rgba([0xb0, 0x80, 0x10, 0xff]),
-    Rgba([0x9c, 0x68, 0x0c, 0xff]),
-    Rgba([0x88, 0x54, 0x08, 0xff]),
-    Rgba([0x74, 0x44, 0x04, 0xff]),
-    Rgba([0x60, 0x30, 0x00, 0xff]),
-    Rgba([0x4c, 0x24, 0x00, 0xff]),
-    Rgba([0x38, 0x14, 0x00, 0xff]),
-    Rgba([0xfc, 0xfc, 0xfc, 0xff]),
-    Rgba([0xfc, 0xd8, 0xd8, 0xff]),
-    Rgba([0xfc, 0xb8, 0xb8, 0xff]),
-    Rgba([0xfc, 0x98, 0x9c, 0xff]),
-    Rgba([0xfc, 0x78, 0x80, 0xff]),
-    Rgba([0xfc, 0x58, 0x64, 0xff]),
-    Rgba([0xfc, 0x38, 0x4c, 0xff]),
-    Rgba([0xfc, 0x1c, 0x34, 0xff]),
-    Rgba([0xdc, 0x14, 0x28, 0xff]),
-    Rgba([0xc0, 0x0c, 0x1c, 0xff]),
-    Rgba([0xa4, 0x08, 0x14, 0xff]),
-    Rgba([0x88, 0x04, 0x0c, 0xff]),
-    Rgba([0x6c, 0x00, 0x04, 0xff]),
-    Rgba([0x50, 0x00, 0x00, 0xff]),
-    Rgba([0x34, 0x00, 0x00, 0xff]),
-    Rgba([0x18, 0x00, 0x00, 0xff]),
-    Rgba([0xfc, 0xec, 0xd8, 0xff]),
-    Rgba([0xfc, 0xdc, 0xb8, 0xff]),
-    Rgba([0xfc, 0xcc, 0x98, 0xff]),
-    Rgba([0xfc, 0xbc, 0x7c, 0xff]),
-    Rgba([0xfc, 0xac, 0x5c, 0xff]),
-    Rgba([0xfc, 0x9c, 0x3c, 0xff]),
-    Rgba([0xfc, 0x8c, 0x1c, 0xff]),
-    Rgba([0xfc, 0x7c, 0x00, 0xff]),
-    Rgba([0xe0, 0x6c, 0x00, 0xff]),
-    Rgba([0xc0, 0x60, 0x00, 0xff]),
-    Rgba([0xa4, 0x50, 0x00, 0xff]),
-    Rgba([0x88, 0x44, 0x00, 0xff]),
-    Rgba([0x6c, 0x34, 0x00, 0xff]),
-    Rgba([0x50, 0x24, 0x00, 0xff]),
-    Rgba([0x34, 0x18, 0x00, 0xff]),
-    Rgba([0x18, 0x08, 0x00, 0xff]),
-    Rgba([0xfc, 0xfc, 0xd8, 0xff]),
-    Rgba([0xf4, 0xf4, 0x9c, 0xff]),
-    Rgba([0xec, 0xec, 0x60, 0xff]),
-    Rgba([0xe4, 0xe4, 0x2c, 0xff]),
-    Rgba([0xdc, 0xdc, 0x00, 0xff]),
-    Rgba([0xc0, 0xc0, 0x00, 0xff]),
-    Rgba([0xa4, 0xa4, 0x00, 0xff]),
-    Rgba([0x88, 0x88, 0x00, 0xff]),
-    Rgba([0x6c, 0x6c, 0x00, 0xff]),
-    Rgba([0x50, 0x50, 0x00, 0xff]),
-    Rgba([0x34, 0x34, 0x00, 0xff]),
-    Rgba([0x18, 0x18, 0x00, 0xff]),
-    Rgba([0xd8, 0xfc, 0xd8, 0xff]),
-    Rgba([0xb0, 0xfc, 0xac, 0xff]),
-    Rgba([0x8c, 0xfc, 0x80, 0xff]),
-    Rgba([0x6c, 0xfc, 0x54, 0xff]),
-    Rgba([0x50, 0xfc, 0x28, 0xff]),
-    Rgba([0x38, 0xfc, 0x00, 0xff]),
-    Rgba([0x28, 0xdc, 0x00, 0xff]),
-    Rgba([0x1c, 0xc0, 0x00, 0xff]),
-    Rgba([0x14, 0xa4, 0x00, 0xff]),
-    Rgba([0x0c, 0x88, 0x00, 0xff]),
-    Rgba([0x04, 0x6c, 0x00, 0xff]),
-    Rgba([0x00, 0x50, 0x00, 0xff]),
-    Rgba([0x00, 0x34, 0x00, 0xff]),
-    Rgba([0x00, 0x18, 0x00, 0xff]),
-    Rgba([0xd8, 0xd8, 0xfc, 0xff]),
-    Rgba([0xb8, 0xb8, 0xfc, 0xff]),
-    Rgba([0x98, 0x98, 0xfc, 0xff]),
-    Rgba([0x7c, 0x7c, 0xfc, 0xff]),
-    Rgba([0x5c, 0x5c, 0xfc, 0xff]),
-    Rgba([0x3c, 0x3c, 0xfc, 0xff]),
-    Rgba([0x00, 0x00, 0xfc, 0xff]),
-    Rgba([0x00, 0x00, 0xe0, 0xff]),
-    Rgba([0x00, 0x00, 0xc0, 0xff]),
-    Rgba([0x00, 0x00, 0xa4, 0xff]),
-    Rgba([0x00, 0x00, 0x88, 0xff]),
-    Rgba([0x00, 0x00, 0x6c, 0xff]),
-    Rgba([0x00, 0x00, 0x50, 0xff]),
-    Rgba([0x00, 0x00, 0x34, 0xff]),
-    Rgba([0x00, 0x00, 0x18, 0xff]),
-    Rgba([0xe8, 0xc8, 0xe8, 0xff]),
-    Rgba([0xd4, 0x98, 0xd4, 0xff]),
-    Rgba([0xc4, 0x6c, 0xc4, 0xff]),
-    Rgba([0xb0, 0x48, 0xb0, 0xff]),
-    Rgba([0xa0, 0x28, 0xa0, 0xff]),
-    Rgba([0x8c, 0x10, 0x8c, 0xff]),
-    Rgba([0x7c, 0x00, 0x7c, 0xff]),
-    Rgba([0x6c, 0x00, 0x6c, 0xff]),
-    Rgba([0x60, 0x00, 0x60, 0xff]),
-    Rgba([0x50, 0x00, 0x50, 0xff]),
-    Rgba([0x44, 0x00, 0x44, 0xff]),
-    Rgba([0x34, 0x00, 0x34, 0xff]),
-    Rgba([0x24, 0x00, 0x24, 0xff]),
-    Rgba([0x18, 0x00, 0x18, 0xff]),
-    Rgba([0xf4, 0xe8, 0xe4, 0xff]),
-    Rgba([0xec, 0xdc, 0xd4, 0xff]),
-    Rgba([0xe4, 0xcc, 0xc0, 0xff]),
-    Rgba([0xe0, 0xc0, 0xb0, 0xff]),
-    Rgba([0xd8, 0xb0, 0xa0, 0xff]),
-    Rgba([0xd0, 0xa4, 0x90, 0xff]),
-    Rgba([0xc8, 0x98, 0x80, 0xff]),
-    Rgba([0xc4, 0x8c, 0x74, 0xff]),
-    Rgba([0xac, 0x7c, 0x64, 0xff]),
-    Rgba([0x98, 0x6c, 0x58, 0xff]),
-    Rgba([0x80, 0x5c, 0x4c, 0xff]),
-    Rgba([0x6c, 0x4c, 0x3c, 0xff]),
-    Rgba([0x54, 0x3c, 0x30, 0xff]),
-    Rgba([0x3c, 0x2c, 0x24, 0xff]),
-    Rgba([0x28, 0x1c, 0x14, 0xff]),
-    Rgba([0x10, 0x0c, 0x08, 0xff]),
-    Rgba([0xec, 0xec, 0xec, 0xff]),
-    Rgba([0xdc, 0xdc, 0xdc, 0xff]),
-    Rgba([0xcc, 0xcc, 0xcc, 0xff]),
-    Rgba([0xbc, 0xbc, 0xbc, 0xff]),
-    Rgba([0xac, 0xac, 0xac, 0xff]),
-    Rgba([0x9c, 0x9c, 0x9c, 0xff]),
-    Rgba([0x8c, 0x8c, 0x8c, 0xff]),
-    Rgba([0x7c, 0x7c, 0x7c, 0xff]),
-    Rgba([0x6c, 0x6c, 0x6c, 0xff]),
-    Rgba([0x60, 0x60, 0x60, 0xff]),
-    Rgba([0x50, 0x50, 0x50, 0xff]),
-    Rgba([0x44, 0x44, 0x44, 0xff]),
-    Rgba([0x34, 0x34, 0x34, 0xff]),
-    Rgba([0x24, 0x24, 0x24, 0xff]),
-    Rgba([0x18, 0x18, 0x18, 0xff]),
-    Rgba([0x08, 0x08, 0x08, 0xff]),
-    Rgba([0xe8, 0xe0, 0xd4, 0xff]),
-    Rgba([0xd8, 0xc8, 0xb0, 0xff]),
-    Rgba([0xc8, 0xb0, 0x90, 0xff]),
-    Rgba([0xb8, 0x98, 0x70, 0xff]),
-    Rgba([0xa8, 0x84, 0x58, 0xff]),
-    Rgba([0x98, 0x70, 0x40, 0xff]),
-    Rgba([0x88, 0x5c, 0x2c, 0xff]),
-    Rgba([0x7c, 0x4c, 0x18, 0xff]),
-    Rgba([0x6c, 0x3c, 0x0c, 0xff]),
-    Rgba([0x5c, 0x34, 0x0c, 0xff]),
-    Rgba([0x4c, 0x2c, 0x0c, 0xff]),
-    Rgba([0x3c, 0x24, 0x0c, 0xff]),
-    Rgba([0x2c, 0x1c, 0x08, 0xff]),
-    Rgba([0x20, 0x14, 0x08, 0xff]),
-    Rgba([0xec, 0xe8, 0xe4, 0xff]),
-    Rgba([0xdc, 0xd4, 0xd0, 0xff]),
-    Rgba([0xcc, 0xc4, 0xbc, 0xff]),
-    Rgba([0xbc, 0xb0, 0xac, 0xff]),
-    Rgba([0xac, 0xa0, 0x98, 0xff]),
-    Rgba([0x9c, 0x90, 0x88, 0xff]),
-    Rgba([0x8c, 0x80, 0x78, 0xff]),
-    Rgba([0x7c, 0x70, 0x68, 0xff]),
-    Rgba([0x6c, 0x60, 0x5c, 0xff]),
-    Rgba([0x60, 0x54, 0x50, 0xff]),
-    Rgba([0x50, 0x48, 0x44, 0xff]),
-    Rgba([0x44, 0x3c, 0x38, 0xff]),
-    Rgba([0x34, 0x30, 0x2c, 0xff]),
-    Rgba([0x24, 0x20, 0x20, 0xff]),
-    Rgba([0x18, 0x14, 0x14, 0xff]),
-    Rgba([0xe0, 0xe8, 0xd4, 0xff]),
-    Rgba([0xc8, 0xd4, 0xb4, 0xff]),
-    Rgba([0xb4, 0xc0, 0x98, 0xff]),
-    Rgba([0x9c, 0xac, 0x7c, 0xff]),
-    Rgba([0x88, 0x98, 0x60, 0xff]),
-    Rgba([0x70, 0x84, 0x4c, 0xff]),
-    Rgba([0x5c, 0x70, 0x38, 0xff]),
-    Rgba([0x4c, 0x5c, 0x28, 0xff]),
-    Rgba([0x40, 0x50, 0x20, 0xff]),
-    Rgba([0x38, 0x44, 0x1c, 0xff]),
-    Rgba([0x30, 0x3c, 0x18, 0xff]),
-    Rgba([0x28, 0x30, 0x14, 0xff]),
-    Rgba([0x20, 0x24, 0x10, 0xff]),
-    Rgba([0x18, 0x1c, 0x08, 0xff]),
-    Rgba([0x0c, 0x10, 0x04, 0xff]),
-    Rgba([0xec, 0xd8, 0xcc, 0xff]),
-    Rgba([0xdc, 0xb8, 0xa0, 0xff]),
-    Rgba([0xcc, 0x98, 0x7c, 0xff]),
-    Rgba([0xbc, 0x80, 0x5c, 0xff]),
-    Rgba([0xac, 0x64, 0x3c, 0xff]),
-    Rgba([0x9c, 0x50, 0x24, 0xff]),
-    Rgba([0x8c, 0x3c, 0x0c, 0xff]),
-    Rgba([0x7c, 0x2c, 0x00, 0xff]),
-    Rgba([0x6c, 0x24, 0x00, 0xff]),
-    Rgba([0x60, 0x20, 0x00, 0xff]),
-    Rgba([0x50, 0x1c, 0x00, 0xff]),
-    Rgba([0x44, 0x14, 0x00, 0xff]),
-    Rgba([0x34, 0x10, 0x00, 0xff]),
-    Rgba([0x24, 0x0c, 0x00, 0xff]),
-    Rgba([0xf0, 0xf0, 0xfc, 0xff]),
-    Rgba([0xe4, 0xe4, 0xfc, 0xff]),
-    Rgba([0xd8, 0xd8, 0xfc, 0xff]),
-    Rgba([0xcc, 0xcc, 0xfc, 0xff]),
-    Rgba([0xc0, 0xc0, 0xfc, 0xff]),
-    Rgba([0xb4, 0xb4, 0xfc, 0xff]),
-    Rgba([0xa8, 0xa8, 0xfc, 0xff]),
-    Rgba([0x9c, 0x9c, 0xfc, 0xff]),
-    Rgba([0x84, 0xd0, 0x00, 0xff]),
-    Rgba([0x84, 0xb0, 0x00, 0xff]),
-    Rgba([0x7c, 0x94, 0x00, 0xff]),
-    Rgba([0x68, 0x78, 0x00, 0xff]),
-    Rgba([0x50, 0x58, 0x00, 0xff]),
-    Rgba([0x3c, 0x40, 0x00, 0xff]),
-    Rgba([0x2c, 0x24, 0x00, 0xff]),
-    Rgba([0x1c, 0x08, 0x00, 0xff]),
-    Rgba([0x20, 0x00, 0x00, 0xff]),
-    Rgba([0xec, 0xd8, 0xc4, 0xff]),
-    Rgba([0xdc, 0xc0, 0xb4, 0xff]),
-    Rgba([0xcc, 0xb4, 0xa0, 0xff]),
-    Rgba([0xbc, 0x9c, 0x94, 0xff]),
-    Rgba([0xac, 0x90, 0x80, 0xff]),
-    Rgba([0x9c, 0x84, 0x74, 0xff]),
-    Rgba([0x8c, 0x74, 0x64, 0xff]),
-    Rgba([0x7c, 0x64, 0x58, 0xff]),
-    Rgba([0x6c, 0x54, 0x4c, 0xff]),
-    Rgba([0x60, 0x48, 0x44, 0xff]),
-    Rgba([0x50, 0x40, 0x38, 0xff]),
-    Rgba([0x44, 0x34, 0x2c, 0xff]),
-    Rgba([0x34, 0x2c, 0x24, 0xff]),
-    Rgba([0x24, 0x18, 0x18, 0xff]),
-    Rgba([0x18, 0x10, 0x10, 0xff]),
-    Rgba([0xfc, 0xfc, 0xfc, 0xff]),
-    Rgba([0xb0, 0xd4, 0xf0, 0xff]),
-    Rgba([0x70, 0xac, 0xe4, 0xff]),
-    Rgba([0x34, 0x8c, 0xd8, 0xff]),
-    Rgba([0x00, 0x6c, 0xd0, 0xff]),
-    Rgba([0x30, 0x8c, 0xd8, 0xff]),
-    Rgba([0x6c, 0xb0, 0xe4, 0xff]),
-    Rgba([0xb0, 0xd4, 0xf0, 0xff]),
-    Rgba([0xfc, 0xfc, 0xfc, 0xff]),
-    Rgba([0xfc, 0xec, 0x40, 0xff]),
-    Rgba([0xfc, 0xc0, 0x28, 0xff]),
-    Rgba([0xfc, 0x8c, 0x10, 0xff]),
-    Rgba([0xfc, 0x50, 0x00, 0xff]),
-    Rgba([0xc8, 0x38, 0x00, 0xff]),
-    Rgba([0x98, 0x28, 0x00, 0xff]),
-    Rgba([0x68, 0x18, 0x00, 0xff]),
-    Rgba([0x7c, 0xdc, 0x7c, 0xff]),
-    Rgba([0x44, 0xb4, 0x44, 0xff]),
-    Rgba([0x18, 0x90, 0x18, 0xff]),
-    Rgba([0x00, 0x6c, 0x00, 0xff]),
-    Rgba([0xf8, 0xb8, 0xfc, 0xff]),
-    Rgba([0xfc, 0x64, 0xec, 0xff]),
-    Rgba([0xfc, 0x00, 0xb4, 0xff]),
-    Rgba([0xcc, 0x00, 0x70, 0xff]),
-    Rgba([0xfc, 0xfc, 0xfc, 0xff]),
-    Rgba([0xfc, 0xfc, 0x00, 0xff]),
-    Rgba([0xfc, 0xd0, 0x00, 0xff]),
-    Rgba([0xfc, 0xac, 0x00, 0xff]),
-    Rgba([0x00, 0x00, 0x00, 0xff]),
-    Rgba([0x64, 0x3c, 0x10, 0xff]),
-    Rgba([0xfc, 0xd0, 0x70, 0xff]),
-    Rgba([0xfa, 0x40, 0x01, 0xff]),
-];
+fn main() -> Result<()> {
+    let Some(path) = env::var_os("U7_PATH") else {
+        bail!("Please specify path to the game files in environment variable 'U7_PATH'");
+    };
+    let data = U7Data::load(path)?;
 
-// From https://github.com/exult/exult/blob/master/docs/bgitems.txt
-static SHAPE_NAMES: [&str; 1024] = [
-    "carpet",
-    "sidewalk",
-    "",
-    "lightning",
-    "grass",
-    "cavefloor",
-    "arrow",
-    "spring",
-    "water",
-    "fireball",
-    "sand",
-    "ether",
-    "void",
-    "spring",
-    "ford",
-    "ford",
-    "rut",
-    "planking",
-    "tile",
-    "",
-    "",
-    "stone_floor",
-    "swamp",
-    "dirt",
-    "cobblestone",
-    "rut",
-    "",
-    "carpet",
-    "sandy_grass",
-    "muddy_bank",
-    "",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "grass",
-    "rocky_grass",
-    "carpet",
-    "ethereal_void",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "cavefloor",
-    "",
-    "",
-    "grass",
-    "muck",
-    "enchant_missiles",
-    "heal",
-    "light",
-    "destroy_trap",
-    "sleep",
-    "unlock_magic",
-    "light",
-    "dispel_field",
-    "heal",
-    "seance",
-    "explosion",
-    "reveal",
-    "charm",
-    "flamestrike",
-    "delayed_explosion",
-    "",
-    "ford",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "muddy_bank",
-    "",
-    "sandy_ground",
-    "ford",
-    "swamp",
-    "swamp",
-    "swamp",
-    "swamp",
-    "swamp",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "sandy_grass",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grassy_mud",
-    "grass",
-    "grass",
-    "grass",
-    "mud",
-    "gangplank",
-    "wall",
-    "wall",
-    "oppressor",
-    "mage",
-    "the_ferryman",
-    "tile_roof",
-    "moongate",
-    "stand",
-    "pocketwatch",
-    "greer_plant",
-    "",
-    "",
-    "rock_outcropping",
-    "slate_roof",
-    "slate_roof",
-    "slate_roof",
-    "slate_roof",
-    "beam_of_light",
-    "slate_roof",
-    "wood_roof",
-    "wood_roof",
-    "wood_roof",
-    "wood_roof",
-    "wood_roof",
-    "wood_roof",
-    "wood_roof",
-    "alchemist_device",
-    "cloth_map",
-    "lightning",
-    "mountain",
-    "tree",
-    "mountain",
-    "mountain",
-    "caddelite_meteor",
-    "dead_tree",
-    "carpet",
-    "carpet",
-    "rug",
-    "floor",
-    "carpet",
-    "fortress",
-    "fortress",
-    "floor",
-    "knights_bridge_piece",
-    "mountain",
-    "mountain",
-    "mountain",
-    "light",
-    "mast",
-    "trap",
-    "debris",
-    "debris",
-    "small_rock",
-    "scorch_mark",
-    "wall",
-    "wall",
-    "scorch_mark",
-    "broken_door",
-    "dust",
-    "chicken_coop",
-    "broken_door",
-    "bridge",
-    "bridge",
-    "bridge",
-    "bridge",
-    "broken_wall",
-    "broken_wall",
-    "wall",
-    "wall",
-    "wall",
-    "wall",
-    "blue_flag",
-    "broken_roof",
-    "dust",
-    "abbey_door",
-    "flying_gargoyle",
-    "alagner",
-    "papa",
-    "mama",
-    "ethereal_monster",
-    "blinker",
-    "red_flag",
-    "platform",
-    "sphere_generator",
-    "sphere_generator",
-    "sphere_generator",
-    "sphere_generator",
-    "cube_generator",
-    "cube_generator",
-    "cube_generator",
-    "cube_generator",
-    "tetrahedron_generator",
-    "tetrahedron_generator",
-    "tetrahedron_generator",
-    "tetrahedron_generator",
-    "abbey_door",
-    "paladin",
-    "green_flag",
-    "top",
-    "abbey_door",
-    "sails",
-    "grandfather_clock",
-    "wall",
-    "wall",
-    "broken_wall",
-    "delta",
-    "fortress_gateway",
-    "keg",
-    "fighter",
-    "fortress",
-    "loom",
-    "go_away!",
-    "fortress",
-    "iron_bars",
-    "townsman",
-    "wall",
-    "mysterious_craft",
-    "mirror",
-    "carpet",
-    "door",
-    "portcullis",
-    "portcullis",
-    "wall",
-    "gargoyle_warrior",
-    "egg",
-    "crossbeam",
-    "crossbeam",
-    "musket",
-    "cavern",
-    "ignite",
-    "curse",
-    "painting",
-    "desk",
-    "sundial",
-    "cloak",
-    "banner",
-    "swordstrike",
-    "slime_attack",
-    "the_passion_play_theatre",
-    "closed_shutters",
-    "closed_shutters",
-    "seat",
-    "tapestry",
-    "carpet",
-    "wedding_ring",
-    "ring_of_invisibility",
-    "ring_of_protection",
-    "ring_of_regeneration",
-    "ghost",
-    "cooking_utensils",
-    "cart",
-    "pumpkin",
-    "metal_wall",
-    "blacksmith",
-    "the_black_gate",
-    "evergreen",
-    "laboratory_burner",
-    "wall",
-    "fallen_tree",
-    "tree",
-    "trophy",
-    "gargoyle_futon",
-    "stump",
-    "weeds",
-    "fallen_tree",
-    "large_rock",
-    "ghost",
-    "sage",
-    "peasant",
-    "brambles",
-    "reeds",
-    "open_shutters",
-    "cattails",
-    "mountain",
-    "dead_tree",
-    "tropical_plant",
-    "cypress_tree",
-    "baobab_tree",
-    "kite",
-    "virtue_stone",
-    "rock",
-    "tree",
-    "table",
-    "bubbles",
-    "bubbles",
-    "light_source",
-    "ghost",
-    "lit_light_source",
-    "dispel_magic",
-    "potions",
-    "rock",
-    "boulder",
-    "boulder",
-    "wall",
-    "wall",
-    "wall",
-    "broken_wall",
-    "wall",
-    "wall",
-    "wall",
-    "wall",
-    "fortress",
-    "greaves",
-    "liche",
-    "wall",
-    "broken_wall",
-    "wall",
-    "wall",
-    "wall",
-    "sign",
-    "sign",
-    "wall",
-    "gargoyle_futon",
-    "platform",
-    "wall",
-    "wall",
-    "floor",
-    "floor",
-    "floor",
-    "floor",
-    "wall",
-    "open_shutters",
-    "glass_wall",
-    "wall",
-    "unicorn",
-    "door",
-    "food_items",
-    "fence",
-    "sign",
-    "cyclops",
-    "three_headed_hydra",
-    "kissme",
-    "magic_helm",
-    "waves",
-    "stairs",
-    "stairs",
-    "stairs",
-    "eating_utensils",
-    "cavern",
-    "cavern",
-    "cavern",
-    "abbey_door",
-    "wall",
-    "guard",
-    "mountain",
-    "mountain",
-    "",
-    "",
-    "energy_mist",
-    "body",
-    "pirate",
-    "ferry",
-    "batlin",
-    "honeycomb",
-    "ships_hold",
-    "nightstand",
-    "desk",
-    "paralyze",
-    "trophy",
-    "mining_machine",
-    "conveyer_belt",
-    "the_black_gate_dais",
-    "carpet",
-    "body",
-    "garbage",
-    "drawers",
-    "magic_bolts",
-    "giant_bones",
-    "delta",
-    "fence",
-    "fence",
-    "fence",
-    "crops",
-    "poison",
-    "wall",
-    "stairs",
-    "stairs",
-    "stairs",
-    "stairs",
-    "stairs",
-    "bellows",
-    "door",
-    "door",
-    "cask",
-    "lit_sconce",
-    "wagon_floor",
-    "wagon_wheel",
-    "window",
-    "chimney",
-    "light",
-    "floor",
-    "fireplace",
-    "telekinesis",
-    "hood",
-    "mage",
-    "mage",
-    "wounded_man",
-    "sage",
-    "beggar",
-    "beggar",
-    "noble",
-    "peasant",
-    "tree",
-    "shopkeeper",
-    "shopkeeper",
-    "noble",
-    "gypsy",
-    "pirate",
-    "wench",
-    "ranger",
-    "ranger",
-    "fighter",
-    "fighter",
-    "paladin",
-    "iolo",
-    "lord_british",
-    "jester",
-    "entertainer",
-    "entertainer",
-    "well",
-    "child",
-    "child",
-    "gargoyle_noble",
-    "sling",
-    "gargoyle_worker",
-    "smith_the_horse",
-    "frank_the_fox",
-    "sherry_the_mouse",
-    "emp",
-    "draxinusom",
-    "sconce",
-    "batlin",
-    "rug",
-    "bars",
-    "highwayman",
-    "statue",
-    "shamino",
-    "dupre",
-    "spark",
-    "jaana",
-    "acid_slug",
-    "alligator",
-    "bat",
-    "bee",
-    "cat",
-    "dog",
-    "wall",
-    "chicken",
-    "corpser",
-    "cow",
-    "cyclops",
-    "deer",
-    "puppet_show",
-    "dragon",
-    "drake",
-    "hook",
-    "corpse",
-    "stained_glass_window",
-    "fish",
-    "fox",
-    "gazer",
-    "stained_glass_window",
-    "gremlin",
-    "headless",
-    "closed_drawbridge",
-    "delta",
-    "insects",
-    "glass_counter_tops",
-    "liche",
-    "virtue_roulette_table",
-    "mouse",
-    "locked_chest",
-    "rat",
-    "reaper",
-    "sea_serpent",
-    "lit_lamp",
-    "death_bolt",
-    "skeleton",
-    "slime",
-    "snake",
-    "cavern",
-    "harpie",
-    "troll",
-    "wisp",
-    "spent_sconce",
-    "tentacles",
-    "wolf",
-    "fence",
-    "chain_coif",
-    "douse",
-    "great_helm",
-    "crested_helm",
-    "buckler",
-    "broken_columns",
-    "curved_heater",
-    "broken_dish",
-    "magic_sword",
-    "hoe_of_destruction",
-    "lightning_whip",
-    "magic_boomerang",
-    "fire_sword",
-    "magic_axe",
-    "firedoom_staff",
-    "burst_arrows",
-    "hawk",
-    "magic_arrows",
-    "juggernaut_hammer",
-    "lucky_arrows",
-    "magebane",
-    "love_arrows",
-    "great_dagger",
-    "the_death_scythe",
-    "blowgun",
-    "poison_dagger",
-    "starbursts",
-    "glimmer",
-    "sword_of_defense",
-    "tseramed_arrows",
-    "leather_armour",
-    "scale_armour",
-    "chain_armour",
-    "wooden_shield",
-    "plate_armour",
-    "leather_leggings",
-    "chain_leggings",
-    "plate_leggings",
-    "pedestal",
-    "spiked_shield",
-    "leather_gloves",
-    "gauntlets",
-    "ammunition",
-    "leather_collar",
-    "bed_roll",
-    "kidney_belt",
-    "shoes",
-    "gorget",
-    "boots",
-    "swamp_boots",
-    "pitchfork",
-    "club",
-    "main_gauche",
-    "spears",
-    "throwing_axes",
-    "daggers",
-    "torch",
-    "morning_star",
-    "bow",
-    "crossbow",
-    "sword",
-    "two-handed_hammer",
-    "two_handed_axe",
-    "two-handed_sword",
-    "halberd",
-    "glass_sword",
-    "boomerang",
-    "magic_bow",
-    "path",
-    "decorative_sword",
-    "kite_shield",
-    "delta",
-    "lily_pads",
-    "surf",
-    "surf",
-    "cleaver",
-    "knives",
-    "bottle",
-    "the_time_lord",
-    "scythe",
-    "fern",
-    "rake",
-    "delayed_explosion",
-    "whip",
-    "hammers",
-    "pick",
-    "shovel",
-    "hoe",
-    "lockpicks",
-    "cup",
-    "lightning_wand",
-    "fire_wand",
-    "tree",
-    "surf",
-    "table",
-    "standing_stone",
-    "custom_sword",
-    "serpentine_dagger",
-    "serpentine_sword",
-    "caddellite_helmet",
-    "death_vortex",
-    "ring",
-    "keys",
-    "book",
-    "tree",
-    "gold_coins",
-    "gold_nuggets",
-    "gold_bars",
-    "triple_crossbow",
-    "sleeping_powder",
-    "venom",
-    "sextant",
-    "spinning_wheel",
-    "cart",
-    "bale_of_wool",
-    "spindle_of_thread",
-    "topiary",
-    "wine_press",
-    "curtain",
-    "dough",
-    "mace",
-    "cart",
-    "mongbat",
-    "fishing_rod",
-    "magic_shield",
-    "stove",
-    "prow",
-    "magic_armor",
-    "cobwebs",
-    "sword_blank",
-    "cactus",
-    "maple_tree",
-    "mushrooms",
-    "shrubbery",
-    "plant",
-    "silverleaf_tree",
-    "desk_item",
-    "",
-    "sack_of_wheat",
-    "curtain",
-    "drawers",
-    "deck",
-    "jar",
-    "glass_item",
-    "tree",
-    "trellis",
-    "mechanism",
-    "magic_leggings",
-    "pillar",
-    "blank_type",
-    "harpsichord",
-    "xylophone",
-    "lyre",
-    "lute",
-    "whistle",
-    "cave_door",
-    "grandfather_clock",
-    "bed_",
-    "podium",
-    "shears",
-    "surf",
-    "deck",
-    "lit_torch",
-    "cannon",
-    "cannon_ball",
-    "powder_keg",
-    "rope_ladder",
-    "scorpion",
-    "the_black_sword",
-    "stocks",
-    "guillotine",
-    "log_saw",
-    "mill_stone",
-    "stove",
-    "post",
-    "rope_ladder",
-    "tombstone",
-    "bird",
-    "plate",
-    "pedestal",
-    "water_trough",
-    "guard",
-    "avatar",
-    "arrows",
-    "bolts",
-    "fellowship_icon",
-    "virtue_roulette_wheel",
-    "lens",
-    "horse",
-    "caddellite_chunks",
-    "crystal_ball",
-    "baby",
-    "",
-    "window",
-    "carpet",
-    "guillotine",
-    "archery_target",
-    "surf",
-    "surf",
-    "pants",
-    "firepit",
-    "well",
-    "water_trough",
-    "stuffed_toy",
-    "strength_tester",
-    "telescope",
-    "harp",
-    "the_orrery_crystal",
-    "soul_cage",
-    "well_of_souls",
-    "alchemist_aparatus",
-    "carpet",
-    "surf",
-    "music_box",
-    "stone_harpie",
-    "vial",
-    "orrery_paths",
-    "caltrops",
-    "cart",
-    "carpet",
-    "ethereal_ring",
-    "gem",
-    "spellbook",
-    "body",
-    "the_rat_race_game",
-    "the_rat_race_game",
-    "the_planet_britannia",
-    "the_moon_trammel",
-    "small_orrery",
-    "energy_field",
-    "smokebombs",
-    "orrery_viewer",
-    "rudyoms_wand",
-    "honey",
-    "cart",
-    "cart",
-    "ship_rails",
-    "moongate",
-    "moongate",
-    "body",
-    "moongate",
-    "bubbles",
-    "gang_plank",
-    "flaming_oil",
-    "tree",
-    "emp",
-    "orb_of_the_moons",
-    "the_vortex_cube",
-    "lever",
-    "switch",
-    "sword_in_a_stone",
-    "invisibility_dust",
-    "ship",
-    "magicians_wand",
-    "",
-    "water",
-    "mantle",
-    "draft_horse",
-    "scroll",
-    "sealed_box",
-    "unsealed_box",
-    "chest",
-    "backpack",
-    "bag",
-    "basket",
-    "crate",
-    "forskis",
-    "guard",
-    "lightning",
-    "surf",
-    "the_triples_game",
-    "bucket",
-    "rabbit",
-    "iron_maiden",
-    "the_rack",
-    "the_triples_game",
-    "stone_chips",
-    "nest",
-    "cactus",
-    "the_triples_game",
-    "barrel",
-    "plaque",
-    "painting",
-    "diaper",
-    "artists_equipment",
-    "pitcher",
-    "campfire",
-    "tree_top",
-    "bandages",
-    "wall",
-    "floor",
-    "gear",
-    "baking_hearth",
-    "glass_wall",
-    "glass_wall",
-    "surf",
-    "magic_gauntlets",
-    "antique_armor",
-    "easel",
-    "avatar_costume",
-    "hourglass",
-    "flying_carpet",
-    "glass_wall",
-    "reagents",
-    "magic_gorget",
-    "sea_serpent",
-    "wall",
-    "mantle",
-    "table_",
-    "mirror",
-    "tapestry",
-    "carpet",
-    "cloth",
-    "crenellations",
-    "greenhouse_roof",
-    "statue",
-    "rats_face_cage",
-    "fire_bolt",
-    "dragon_breath",
-    "bookshelf",
-    "casting_frames",
-    "fencing_dummy",
-    "troll",
-    "shaft",
-    "kitchen_items",
-    "toddler",
-    "spider",
-    "thumbscrews",
-    "victim",
-    "wall_mount",
-    "wall",
-    "drawbridge",
-    "wall",
-    "stove",
-    "chair",
-    "",
-    "surf",
-    "metal_wall",
-    "rune",
-    "crenellations",
-    "wall",
-    "shaft",
-    "elizabeth",
-    "abraham",
-    "wingless_gargoyle",
-    "fellowship_member",
-    "fellowship_staff",
-    "anchor",
-    "test_tubes",
-    "horn",
-    "lamp_post",
-    "table",
-    "wood_roof",
-    "body",
-    "pool_of_water",
-    "monolith",
-    "fire_field",
-    "crenellations",
-    "seat",
-    "altar",
-    "wall",
-    "poison_field",
-    "crenellations",
-    "sleep_field",
-    "crenellations",
-    "wall",
-    "cavern",
-    "statue",
-    "surf",
-    "tile_roof",
-    "wall",
-    "wall",
-    "surf",
-    "blood",
-    "pillar",
-    "blackrock",
-    "chunks_of_lead",
-    "chunks_of_iron_ore",
-    "shaft",
-    "surf",
-    "bookshelf",
-    "pillar",
-    "betting_marker",
-    "small_bush",
-    "piece_of_wood",
-    "cavern",
-    "cavern",
-    "delta",
-    "delta",
-    "cavern",
-    "fellowship_member",
-    "delta",
-    "mountain",
-    "tree",
-    "millsaw",
-    "water_wheel",
-    "portcullis_door",
-    "portcullis_door",
-    "gargoyle_jewelry",
-    "delta",
-    "wall",
-    "wall",
-    "water_wheel",
-    "water_wheel",
-    "wall",
-    "pot",
-    "guardian_statue",
-    "guard",
-    "bee_stingers",
-    "bolts",
-    "winch",
-    "winch",
-    "water_wheel",
-    "the_ferryman",
-    "wall",
-    "greenhouse_roof",
-    "amulet",
-    "wood_roof",
-    "barkeep",
-    "the_moon_felucca",
-    "mountain",
-    "mushroom",
-    "barge",
-    "slate_roof",
-    "slate_roof",
-    "table",
-    "child",
-    "tile_roof",
-    "broken_wall",
-    "enclosed_prism",
-    "mountain",
-    "sheep",
-    "table",
-    "wall",
-    "stairs",
-    "stairs",
-    "wagon_door",
-    "wagon",
-    "wagon",
-    "wagon",
-    "wagon_roof",
-    "wall",
-    "prism",
-    "chimney",
-    "mountain",
-    "piece_of_wood",
-    "waves",
-    "stove_top",
-    "baby_in_a_cradle",
-    "planet",
-    "avatar",
-    "the_dark_core",
-    "anvil",
-    "cradle",
-    "mushroom",
-    "tongs",
-    "cauldron",
-    "glass_wall",
-    "spent_light_source",
-    "horseshoe",
-    "plant",
-    "table",
-    "table",
-    "table",
-    "table",
-    "leather_helm",
-    "glass_wall",
-    "broken_wall",
-    "glass_wall",
-    "waves",
-    "waves",
-    "prism",
-    "bed_",
-    "surf",
-    "rocking_horse",
-    "floor",
-    "golem",
-    "floor",
-    "ship",
-    "table",
-    "glass_wall",
-    "surf",
-    "time_barrier",
-    "surf",
-    "haystack",
-];
+    // Decorate shapes with geometry info and save as sprite sheets.
+    for (i, shapes) in data.shapes.iter().enumerate() {
+        let filename = format!("{:04}-{}.png", i, data.shape_name(i));
+        let shapes = shapes
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let mut s = s.clone();
+                s.decorate(data.sprite_dims[i]);
+                s
+            })
+            .collect::<Vec<_>>();
+        if shapes.is_empty() {
+            eprintln!("Skipping empty shape {filename}");
+            continue;
+        }
+        let sheet = build_sheet(&shapes);
+        sheet.save(filename)?;
+    }
+    Ok(())
+}

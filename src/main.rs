@@ -152,7 +152,7 @@ impl Game {
                 893 => Some("man"),
                 945 => Some("automaton"),
                 // Extra Avatar sprite sheets in Serpent Isle
-                1024..1035 => Some("avatar"),
+                1024..1036 => Some("avatar"),
                 _ => None,
             },
         }

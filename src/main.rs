@@ -5,8 +5,6 @@ use std::{
     path::Path,
 };
 
-const NUM_SHAPES: usize = 1024;
-
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use image::{ImageBuffer, Rgba};
@@ -30,6 +28,13 @@ impl Game {
             Some(Game::BlackGate)
         } else {
             None
+        }
+    }
+
+    fn num_shapes(&self) -> usize {
+        match self {
+            Game::BlackGate => 1024,
+            Game::SerpentIsle => 1036,
         }
     }
 
@@ -83,6 +88,8 @@ impl Game {
                 731 => Some("lightning"),
                 893 => Some("man"),
                 945 => Some("automaton"),
+                // Extra Avatar sprite sheets in Serpent Isle
+                1024..1035 => Some("avatar"),
                 _ => None,
             },
         }
@@ -152,7 +159,7 @@ impl U7Data {
         let mut shapes = Vec::new();
         for elt in load_flx(path.join("STATIC/SHAPES.VGA"))?
             .iter()
-            .take(NUM_SHAPES)
+            .take(game.num_shapes())
         {
             let frames = load_shapes(&mut Cursor::new(elt), &palette)?;
             shapes.push(frames);
@@ -168,7 +175,7 @@ impl U7Data {
 
     pub fn shape_name(&self, idx: usize) -> String {
         if idx < self.strings.len() {
-            if self.strings[idx].is_empty() {
+            if self.strings[idx].is_empty() || idx >= 1024 {
                 if let Some(name) = self.game.missing_name(idx) {
                     return name.to_string();
                 }

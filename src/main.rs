@@ -2,16 +2,79 @@ use std::{
     env,
     fs::File,
     io::{prelude::*, Cursor, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
+use clap::Parser;
 use image::{ImageBuffer, Rgba};
 use itertools::Itertools;
 
 type Pixel = Rgba<u8>;
 type Image = ImageBuffer<Pixel, Vec<u8>>;
+
+// Clap-parsed args struct
+#[derive(Debug, Parser)]
+struct Args {
+    /// Path to the game directory.
+    #[arg(long)]
+    pub u7_path: Option<PathBuf>,
+
+    /// Whether to add skewed versions of sprites to make textures of.
+    #[arg(long)]
+    pub include_skewed: bool,
+
+    /// Whether to add base rectangle to sprites.
+    #[arg(long)]
+    pub add_base: bool,
+}
+
+fn main() -> Result<()> {
+    let mut args = Args::parse();
+
+    if args.u7_path.is_none() {
+        let Some(path) = env::var_os("U7_PATH") else {
+            bail!("Please specify path to the game files in environment variable 'U7_PATH'");
+        };
+        args.u7_path = Some(PathBuf::from(path));
+    }
+    let path = args.u7_path.unwrap();
+
+    let data = U7Data::load(path)?;
+
+    // Decorate shapes with geometry info and save as sprite sheets.
+    for (i, ss) in data.shapes.iter().enumerate() {
+        let filename = format!("{:04}-{}.png", i, data.shape_name(i));
+        let mut shapes = Vec::new();
+
+        for s in ss {
+            if s.is_empty() {
+                continue;
+            }
+            let mut shape = s.clone();
+            if args.add_base {
+                shape.decorate(data.sprite_dims[i]);
+            }
+
+            shapes.push(shape);
+
+            if args.include_skewed {
+                for s in s.make_skewed() {
+                    shapes.push(s);
+                }
+            }
+        }
+
+        if shapes.is_empty() {
+            eprintln!("Skipping empty shape {filename}");
+            continue;
+        }
+        let sheet = build_sheet(&shapes);
+        sheet.save(filename)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 enum Game {
@@ -294,6 +357,48 @@ impl Shape {
             }
         }
     }
+
+    pub fn make_skewed(&self) -> Vec<Shape> {
+        let mut ret = Vec::new();
+
+        // Don't skew ground tiles.
+        let Shape::Sprite { ref image, .. } = self else {
+            return ret;
+        };
+
+        let south_face = Image::from_fn(image.width() + image.height(), image.height(), |x, y| {
+            let (x, y) = (x as i32, y as i32);
+            let (w, h) = (image.width() as i32, image.height() as i32);
+            let x = x + y - h;
+            if x >= 0 && x < w && y >= 0 && y < h {
+                *image.get_pixel(x as u32, y as u32)
+            } else {
+                Rgba([0, 0, 0, 0])
+            }
+        });
+
+        let east_face = Image::from_fn(image.width(), image.height() + image.width(), |x, y| {
+            let (x, y) = (x as i32, y as i32);
+            let (w, h) = (image.width() as i32, image.height() as i32);
+            let y = y + x - w;
+            if x >= 0 && x < w && y >= 0 && y < h {
+                *image.get_pixel(x as u32, y as u32)
+            } else {
+                Rgba([0, 0, 0, 0])
+            }
+        });
+
+        ret.push(Shape::Sprite {
+            image: south_face,
+            offset: [0, 0],
+        });
+        ret.push(Shape::Sprite {
+            image: east_face,
+            offset: [0, 0],
+        });
+
+        ret
+    }
 }
 
 pub fn load_shapes<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Vec<Shape>> {
@@ -408,7 +513,7 @@ fn load_sprite<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shap
 }
 
 fn build_sheet(shapes: &[Shape]) -> Image {
-    const COLUMNS: usize = 8;
+    const COLUMNS: usize = 9;
 
     // Determine positions of images and total sheet dimensions.
     let mut width = 0;
@@ -448,32 +553,4 @@ fn build_sheet(shapes: &[Shape]) -> Image {
     }
 
     result
-}
-
-fn main() -> Result<()> {
-    let Some(path) = env::var_os("U7_PATH") else {
-        bail!("Please specify path to the game files in environment variable 'U7_PATH'");
-    };
-    let data = U7Data::load(path)?;
-
-    // Decorate shapes with geometry info and save as sprite sheets.
-    for (i, shapes) in data.shapes.iter().enumerate() {
-        let filename = format!("{:04}-{}.png", i, data.shape_name(i));
-        let shapes = shapes
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let mut s = s.clone();
-                s.decorate(data.sprite_dims[i]);
-                s
-            })
-            .collect::<Vec<_>>();
-        if shapes.is_empty() {
-            eprintln!("Skipping empty shape {filename}");
-            continue;
-        }
-        let sheet = build_sheet(&shapes);
-        sheet.save(filename)?;
-    }
-    Ok(())
 }

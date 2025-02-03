@@ -35,7 +35,7 @@ fn main() -> Result<()> {
 
     if args.u7_path.is_none() {
         let Some(path) = env::var_os("U7_PATH") else {
-            bail!("Please specify path to the game files in environment variable 'U7_PATH'");
+            bail!("Please specify path to the game files in '--u7-path' command-line option or the environment variable 'U7_PATH'");
         };
         args.u7_path = Some(PathBuf::from(path));
     }

@@ -558,7 +558,10 @@ fn build_sheet(shapes: &[Shape]) -> Image {
 
     for (s, (x, y)) in shapes.iter().zip(positions) {
         for (sx, sy, p) in s.as_ref().enumerate_pixels() {
-            result.put_pixel(x + sx, y + sy, *p);
+            // Skip transparent pixels.
+            if p.0[3] != 0 {
+                result.put_pixel(x + sx, y + sy, *p);
+            }
         }
     }
 

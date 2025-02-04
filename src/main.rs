@@ -43,6 +43,14 @@ fn main() -> Result<()> {
 
     let data = U7Data::load(path)?;
 
+    // Output palette as PNG.
+    const PALETTE_SCALE: u32 = 4;
+    let palette_img = ImageBuffer::from_fn(16 * PALETTE_SCALE, 16 * PALETTE_SCALE, |x, y| {
+        let idx = (y / PALETTE_SCALE) * 16 + (x / PALETTE_SCALE);
+        data.palette[idx as usize]
+    });
+    palette_img.save("palette.png")?;
+
     // Decorate shapes with geometry info and save as sprite sheets.
     for (i, ss) in data.shapes.iter().enumerate() {
         let filename = format!("{:04}-{}.png", i, data.shape_name(i));
@@ -164,6 +172,7 @@ struct U7Data {
     pub game: Game,
     pub shapes: Vec<Vec<Shape>>,
     pub strings: Vec<String>,
+    pub palette: Vec<Pixel>,
     pub sprite_dims: Vec<[i32; 3]>,
 }
 
@@ -232,6 +241,7 @@ impl U7Data {
             game,
             shapes,
             strings,
+            palette,
             sprite_dims,
         })
     }

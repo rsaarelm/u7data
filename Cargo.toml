@@ -9,6 +9,7 @@ byteorder = "1"
 clap = { version = "4", features = ["derive"] }
 image = "0.25"
 itertools = "0.14"
+png = "0.17"
 
 [dev-dependencies]
 three-d = "0.18"

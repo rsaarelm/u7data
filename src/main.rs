@@ -28,6 +28,10 @@ struct Args {
     /// Whether to add base rectangle to sprites.
     #[arg(long)]
     pub add_base: bool,
+
+    /// Keep the original palette's transparent color.
+    #[arg(long)]
+    pub keep_transparent_color: bool,
 }
 
 fn main() -> Result<()> {
@@ -41,7 +45,13 @@ fn main() -> Result<()> {
     }
     let path = args.u7_path.unwrap();
 
-    let data = U7Data::load(path)?;
+    let mut data = U7Data::load(path)?;
+
+    // The orange transparent color hurts my eyes, change it to something
+    // nicer.
+    if !args.keep_transparent_color {
+        data.palette[255] = Rgba([0, 255, 255, 0]);
+    }
 
     // Output palette as PNG.
     const PALETTE_SCALE: u32 = 4;
@@ -49,7 +59,7 @@ fn main() -> Result<()> {
         let idx = (y / PALETTE_SCALE) * 16 + (x / PALETTE_SCALE);
         data.palette[idx as usize]
     });
-    palette_img.save("palette.png")?;
+    save_indexed(&palette_img, &data.palette, "palette.png")?;
 
     // Decorate shapes with geometry info and save as sprite sheets.
     for (i, ss) in data.shapes.iter().enumerate() {
@@ -62,7 +72,7 @@ fn main() -> Result<()> {
             }
             let mut shape = s.clone();
             if args.add_base {
-                shape.decorate(data.sprite_dims[i]);
+                shape.decorate(data.sprite_dims[i], &data.palette);
             }
 
             shapes.push(shape);
@@ -78,8 +88,8 @@ fn main() -> Result<()> {
             eprintln!("Skipping empty shape {filename}");
             continue;
         }
-        let sheet = build_sheet(&shapes);
-        sheet.save(filename)?;
+        let sheet = build_sheet(&shapes, &data.palette);
+        save_indexed(&sheet, &data.palette, filename)?;
     }
     Ok(())
 }
@@ -334,7 +344,7 @@ impl Shape {
     }
 
     /// Draw a bounding box behind the shape based on the dimensions.
-    pub fn decorate(&mut self, dim: [i32; 3]) {
+    pub fn decorate(&mut self, dim: [i32; 3], palette: &[Pixel]) {
         if self.is_empty() {
             return;
         }
@@ -363,7 +373,7 @@ impl Shape {
         // Solid-color base for footprint.
         for y in 0..dim[1] * 8 {
             for x in 0..dim[0] * 8 {
-                plot(-x, -y, Rgba([255, 0, 255, 255]));
+                plot(-x, -y, palette[254]);
             }
         }
     }
@@ -522,7 +532,7 @@ fn load_sprite<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shap
     })
 }
 
-fn build_sheet(shapes: &[Shape]) -> Image {
+fn build_sheet(shapes: &[Shape], palette: &[Pixel]) -> Image {
     const COLUMNS: usize = 9;
 
     // Determine positions of images and total sheet dimensions.
@@ -554,7 +564,7 @@ fn build_sheet(shapes: &[Shape]) -> Image {
         x += w;
     }
 
-    let mut result = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 0]));
+    let mut result = ImageBuffer::from_pixel(width, height, palette[255]);
 
     for (s, (x, y)) in shapes.iter().zip(positions) {
         for (sx, sy, p) in s.as_ref().enumerate_pixels() {
@@ -566,4 +576,25 @@ fn build_sheet(shapes: &[Shape]) -> Image {
     }
 
     result
+}
+
+fn save_indexed(image: &Image, palette: &[Pixel], path: impl AsRef<Path>) -> Result<()> {
+    let image_data: Vec<u8> = image
+        .pixels()
+        .map(|p| palette.iter().position(|c| c == p).unwrap_or(0) as u8)
+        .collect();
+
+    let palette_data: Vec<u8> = palette
+        .iter()
+        .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+        .collect();
+
+    let mut writer = File::create(path)?;
+    let mut encoder = png::Encoder::new(&mut writer, image.width(), image.height());
+    encoder.set_color(png::ColorType::Indexed);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_palette(&palette_data);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&image_data)?;
+    Ok(())
 }

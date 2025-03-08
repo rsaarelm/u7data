@@ -67,7 +67,7 @@ fn main() -> Result<()> {
         let mut shapes = Vec::new();
 
         for s in ss {
-            if s.is_empty() {
+            if s.is_empty() && !args.add_base {
                 continue;
             }
             let mut shape = s.clone();
@@ -345,9 +345,7 @@ impl Shape {
 
     /// Draw a bounding box behind the shape based on the dimensions.
     pub fn decorate(&mut self, dim: [i32; 3], palette: &[Pixel]) {
-        if self.is_empty() {
-            return;
-        }
+        let is_empty = self.is_empty();
 
         let Shape::Sprite {
             ref mut image,
@@ -369,6 +367,13 @@ impl Shape {
                 image.put_pixel(x as u32, y as u32, color);
             }
         };
+
+        // Mark empty frames with a blank box.
+        if is_empty {
+            // Color 123 should be a gray pixel.
+            *image = ImageBuffer::from_pixel(8, 8, palette[123]);
+            return;
+        }
 
         // Solid-color base for footprint.
         for y in 0..dim[1] * 8 {

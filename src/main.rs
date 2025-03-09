@@ -355,16 +355,13 @@ impl Shape {
             return;
         };
 
-        let mut plot = |x: i32, y: i32, color| {
+        let mut plot = |force: bool, x: i32, y: i32, color| {
             let x = x - offset[0];
             let y = y - offset[1];
-            if x >= 0
-                && x < image.width() as i32
-                && y >= 0
-                && y < image.height() as i32
-                && image.get_pixel(x as u32, y as u32).0[3] == 0
-            {
-                image.put_pixel(x as u32, y as u32, color);
+            if x >= 0 && x < image.width() as i32 && y >= 0 && y < image.height() as i32 {
+                if force || image.get_pixel(x as u32, y as u32).0[3] == 0 {
+                    image.put_pixel(x as u32, y as u32, color);
+                }
             }
         };
 
@@ -378,7 +375,8 @@ impl Shape {
         // Solid-color base for footprint.
         for y in 0..dim[1] * 8 {
             for x in 0..dim[0] * 8 {
-                plot(-x, -y, palette[254]);
+                let force = (x == 0 && y == 0) || (x == dim[0] * 8 - 1 && y == dim[1] * 8 - 1);
+                plot(force, -x, -y, palette[254]);
             }
         }
     }

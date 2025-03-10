@@ -82,7 +82,7 @@ fn catalog(mut data: U7Data, args: &CatalogArgs) -> Result<()> {
         std::fs::read_to_string(&args.object_database)?
     };
 
-    let db: BTreeMap<String, BTreeMap<ViewKey, View>> = idm::from_str(&db)?;
+    let db: BTreeMap<Natural, BTreeMap<ViewKey, View>> = idm::from_str(&db)?;
 
     // Crummiest possible initial catalog...
     let mut html = String::new();
@@ -93,6 +93,10 @@ fn catalog(mut data: U7Data, args: &CatalogArgs) -> Result<()> {
     )?;
 
     for (name, views) in db {
+        // The Natural wrapper has served is purpose controlling the BTreeMap
+        // order.
+        let name = name.0;
+
         // Filter out empty frames from views
         let views = views
             .into_iter()
@@ -1031,5 +1035,21 @@ pub trait TileSpace: Into<[i32; 3]> + Copy {
 }
 
 impl TileSpace for IVec3 {}
+
+/// Wrapper that imposes natural sorting ("a-10" after "a-9") for strings.
+#[derive(Clone, Eq, PartialEq, Debug, Deserialize)]
+struct Natural(String);
+
+impl Ord for Natural {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        natord::compare(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for Natural {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 // vim:foldmethod=marker

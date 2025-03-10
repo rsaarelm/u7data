@@ -12,6 +12,7 @@ glam = { version = "0.30", features = ["serde"] }
 idm = "0.4.4"
 image = "0.25"
 itertools = "0.14"
+natord = "1"
 png = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_with = "3"

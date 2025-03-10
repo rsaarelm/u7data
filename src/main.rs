@@ -20,15 +20,6 @@ use serde_with::DeserializeFromStr;
 type Pixel = Rgba<u8>;
 type Image = ImageBuffer<Pixel, Vec<u8>>;
 
-// Clap CLI interface spec:
-//
-// Set up an enum with multiple commands:
-//   dump: Dump out all the game graphics, with options
-//   catalog: Generate a HTML catalogue of game objects, needs IDM object
-//     as input.
-//
-//  There's a global flag u7-path that all the commands use.
-
 #[derive(Debug, Parser)]
 struct Args {
     #[command(subcommand)]
@@ -119,7 +110,7 @@ fn catalog(data: U7Data, args: &CatalogArgs) -> Result<()> {
 
         // Save shape as "{name}.png"
         let filename = format!("{name}.png");
-        save_indexed(shape.as_ref(), &data.palette, &filename)?;
+        save_indexed(&shape.image, &data.palette, &filename)?;
 
         writeln!(
             html,
@@ -299,7 +290,7 @@ fn dump(mut data: U7Data, args: &DumpArgs) -> Result<()> {
             }
             let mut shape = s.clone();
             if args.add_base {
-                shape.decorate(data.sprite_dims[i], &data.palette);
+                shape.decorate(&data.palette);
             }
 
             shapes.push(shape);
@@ -411,10 +402,10 @@ impl Game {
 #[derive(Debug)]
 struct U7Data {
     pub game: Game,
-    pub shapes: Vec<Vec<Shape>>,
+    pub shapes: Vec<Vec<Frame>>,
     pub strings: Vec<String>,
     pub palette: Vec<Pixel>,
-    pub sprite_dims: Vec<[i32; 3]>,
+    pub shape_dims: Vec<[i32; 3]>,
 }
 
 impl U7Data {
@@ -426,7 +417,7 @@ impl U7Data {
 
         // Extract dimensions in multiples of 8 pixels for the shapes. This
         // includes data for both tiles and shapes.
-        let mut sprite_dims = Vec::new();
+        let mut shape_dims = Vec::new();
         {
             let mut reader = File::open(path.join("STATIC/TFA.DAT"))?;
             // 24 bit flag sets. See the data structure reference and parse
@@ -437,7 +428,7 @@ impl U7Data {
                 let z = (f1 >> 5) & 0x7;
                 let x = (f3 & 0x7) + 1;
                 let y = ((f3 >> 3) & 0x7) + 1;
-                sprite_dims.push([x as i32, y as i32, z as i32]);
+                shape_dims.push([x as i32, y as i32, z as i32]);
             }
         }
 
@@ -470,11 +461,12 @@ impl U7Data {
             .collect();
 
         let mut shapes = Vec::new();
-        for elt in load_flx(path.join("STATIC/SHAPES.VGA"))?
+        for (i, elt) in load_flx(path.join("STATIC/SHAPES.VGA"))?
             .iter()
+            .enumerate()
             .take(game.num_shapes())
         {
-            let frames = load_shapes(&mut Cursor::new(elt), &palette)?;
+            let frames = load_frames(&mut Cursor::new(elt), &palette, shape_dims[i])?;
             shapes.push(frames);
         }
 
@@ -483,7 +475,7 @@ impl U7Data {
             shapes,
             strings,
             palette,
-            sprite_dims,
+            shape_dims,
         })
     }
 
@@ -511,6 +503,231 @@ impl U7Data {
         "unknown".to_owned()
     }
 }
+
+// {{{1 Frame type
+
+#[derive(Clone, Default, Debug)]
+pub struct Frame {
+    image: Image,
+    // Coordinates of bottom right corner of base in image.
+    offset: [i32; 2],
+    // 3D dimensions in multiples of 8 pixels.
+    dim: [i32; 3],
+}
+
+impl Frame {
+    pub fn tile<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Self> {
+        let mut image = ImageBuffer::new(8, 8);
+
+        for y in 0..8 {
+            for x in 0..8 {
+                image.put_pixel(x, y, palette[reader.read_u8()? as usize]);
+            }
+        }
+
+        Ok(Frame {
+            image,
+            offset: [0, 0],
+            dim: [1, 1, 0],
+        })
+    }
+
+    pub fn sprite<R: Read + Seek>(
+        reader: &mut R,
+        palette: &[Pixel],
+        dim: [i32; 3],
+    ) -> Result<Self> {
+        let max_x = reader.read_u16::<LittleEndian>()? as i16 + 1;
+        let min_x = -(reader.read_u16::<LittleEndian>()? as i16);
+        let min_y = -(reader.read_u16::<LittleEndian>()? as i16);
+        let max_y = reader.read_u16::<LittleEndian>()? as i16 + 1;
+
+        let mut image = ImageBuffer::new((max_x - min_x) as u32, (max_y - min_y) as u32);
+
+        let mut plot = |x, y, color| {
+            image.put_pixel(
+                (x - min_x) as u32,
+                (y - min_y) as u32,
+                palette[color as usize],
+            );
+        };
+
+        loop {
+            let data = reader.read_u16::<LittleEndian>()?;
+            if data == 0 {
+                break;
+            }
+
+            let x = reader.read_i16::<LittleEndian>()?;
+            let y = reader.read_i16::<LittleEndian>()?;
+
+            assert!(x >= min_x && x < max_x && y >= min_y && y < max_y);
+
+            let len = (data >> 1) as usize;
+            let mode = data & 1;
+
+            if mode == 0 {
+                // Raw data
+                for i in 0..len {
+                    plot(x + i as i16, y, reader.read_u8()?);
+                }
+            } else {
+                // RLE data
+                let mut x2 = x;
+                while x2 < x + len as i16 {
+                    let run = reader.read_u8()?;
+                    let run_type = run & 1;
+                    let run_len = (run >> 1) as usize;
+                    if run_type == 0 {
+                        // Raw data.
+                        for _ in 0..run_len {
+                            plot(x2, y, reader.read_u8()?);
+                            x2 += 1;
+                        }
+                    } else {
+                        // Repeat value
+                        let value = reader.read_u8()?;
+                        for _ in 0..run_len {
+                            plot(x2, y, value);
+                            x2 += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Frame {
+            image,
+            offset: [min_x as i32, min_y as i32],
+            dim,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.image.enumerate_pixels().all(|(_, _, p)| p.0[3] == 0)
+    }
+
+    /// Draw a bounding box behind the frame based on the dimensions.
+    pub fn decorate(&mut self, palette: &[Pixel]) {
+        let is_empty = self.is_empty();
+
+        let mut plot = |force: bool, x: i32, y: i32, color| {
+            let x = x - self.offset[0];
+            let y = y - self.offset[1];
+            if x >= 0 && x < self.image.width() as i32 && y >= 0 && y < self.image.height() as i32 {
+                let p = self.image.get_pixel(x as u32, y as u32);
+                if force || p.0[3] == 0 {
+                    self.image.put_pixel(x as u32, y as u32, color);
+                }
+            }
+        };
+
+        // Mark empty frames with a blank box.
+        if is_empty {
+            // Color 123 should be a gray pixel.
+            self.image = ImageBuffer::from_pixel(8, 8, palette[123]);
+            return;
+        }
+
+        // Solid-color base for footprint.
+        for y in 0..self.dim[1] * 8 {
+            for x in 0..self.dim[0] * 8 {
+                let force =
+                    (x == 0 && y == 0) || (x == self.dim[0] * 8 - 1 && y == self.dim[1] * 8 - 1);
+                plot(force, -x, -y, palette[254]);
+            }
+        }
+    }
+
+    pub fn make_skewed(&self) -> Vec<Frame> {
+        let mut ret = Vec::new();
+
+        // Don't skew flat shapes.
+        if self.dim[2] == 0 {
+            return ret;
+        }
+
+        let south_face = Image::from_fn(
+            self.image.width() + self.image.height(),
+            self.image.height(),
+            |x, y| {
+                let (x, y) = (x as i32, y as i32);
+                let (w, h) = (self.image.width() as i32, self.image.height() as i32);
+                let x = x + y - h;
+                if x >= 0 && x < w && y >= 0 && y < h {
+                    *self.image.get_pixel(x as u32, y as u32)
+                } else {
+                    Rgba([0, 0, 0, 0])
+                }
+            },
+        );
+
+        let east_face = Image::from_fn(
+            self.image.width(),
+            self.image.height() + self.image.width(),
+            |x, y| {
+                let (x, y) = (x as i32, y as i32);
+                let (w, h) = (self.image.width() as i32, self.image.height() as i32);
+                let y = y + x - w;
+                if x >= 0 && x < w && y >= 0 && y < h {
+                    *self.image.get_pixel(x as u32, y as u32)
+                } else {
+                    Rgba([0, 0, 0, 0])
+                }
+            },
+        );
+
+        ret.push(Frame {
+            image: south_face,
+            ..Default::default()
+        });
+        ret.push(Frame {
+            image: east_face,
+            ..Default::default()
+        });
+
+        ret
+    }
+}
+
+pub fn load_frames<R: Read + Seek>(
+    reader: &mut R,
+    palette: &[Pixel],
+    dim: [i32; 3],
+) -> Result<Vec<Frame>> {
+    let size = reader.read_u32::<LittleEndian>()? as usize;
+    let input_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(4))?;
+
+    let mut ret = Vec::new();
+
+    // Shape block does not start with an accurate size value, assume it's a
+    // bunch of 8x8 tiles.
+    if size != input_len as usize {
+        reader.seek(SeekFrom::Start(0))?;
+
+        for _ in 0..(input_len / 64) {
+            ret.push(Frame::tile(reader, palette)?);
+        }
+
+        return Ok(ret);
+    }
+
+    let mut offsets = Vec::new();
+    offsets.push(reader.read_u32::<LittleEndian>()? as u64);
+    for _ in 1..(offsets[0] - 4) / 4 {
+        offsets.push(reader.read_u32::<LittleEndian>()? as u64);
+    }
+
+    for offset in offsets {
+        reader.seek(SeekFrom::Start(offset))?;
+        ret.push(Frame::sprite(reader, palette, dim)?);
+    }
+
+    Ok(ret)
+}
+
+// {{{1 utilities
 
 /// Load contents from a FLX file.
 pub fn load_flx(path: impl AsRef<Path>) -> Result<Vec<Vec<u8>>> {
@@ -550,228 +767,7 @@ pub fn load_flx(path: impl AsRef<Path>) -> Result<Vec<Vec<u8>>> {
     Ok(ret)
 }
 
-// {{{1 Shape type
-
-#[derive(Clone, Debug)]
-pub enum Shape {
-    Sprite { image: Image, offset: [i32; 2] },
-
-    // Always 8x8.
-    Tile(Image),
-}
-
-impl AsRef<Image> for Shape {
-    fn as_ref(&self) -> &Image {
-        match self {
-            Shape::Sprite { image, .. } => image,
-            Shape::Tile(image) => image,
-        }
-    }
-}
-
-impl Shape {
-    pub fn is_empty(&self) -> bool {
-        self.as_ref()
-            .enumerate_pixels()
-            .all(|(_, _, p)| p.0[3] == 0)
-    }
-
-    /// Draw a bounding box behind the shape based on the dimensions.
-    pub fn decorate(&mut self, dim: [i32; 3], palette: &[Pixel]) {
-        let is_empty = self.is_empty();
-
-        let Shape::Sprite {
-            ref mut image,
-            offset,
-        } = self
-        else {
-            return;
-        };
-
-        let mut plot = |force: bool, x: i32, y: i32, color| {
-            let x = x - offset[0];
-            let y = y - offset[1];
-            if x >= 0 && x < image.width() as i32 && y >= 0 && y < image.height() as i32 {
-                let p = image.get_pixel(x as u32, y as u32);
-                if force || p.0[3] == 0 {
-                    image.put_pixel(x as u32, y as u32, color);
-                }
-            }
-        };
-
-        // Mark empty frames with a blank box.
-        if is_empty {
-            // Color 123 should be a gray pixel.
-            *image = ImageBuffer::from_pixel(8, 8, palette[123]);
-            return;
-        }
-
-        // Solid-color base for footprint.
-        for y in 0..dim[1] * 8 {
-            for x in 0..dim[0] * 8 {
-                let force = (x == 0 && y == 0) || (x == dim[0] * 8 - 1 && y == dim[1] * 8 - 1);
-                plot(force, -x, -y, palette[254]);
-            }
-        }
-    }
-
-    pub fn make_skewed(&self) -> Vec<Shape> {
-        let mut ret = Vec::new();
-
-        // Don't skew ground tiles.
-        let Shape::Sprite { ref image, .. } = self else {
-            return ret;
-        };
-
-        let south_face = Image::from_fn(image.width() + image.height(), image.height(), |x, y| {
-            let (x, y) = (x as i32, y as i32);
-            let (w, h) = (image.width() as i32, image.height() as i32);
-            let x = x + y - h;
-            if x >= 0 && x < w && y >= 0 && y < h {
-                *image.get_pixel(x as u32, y as u32)
-            } else {
-                Rgba([0, 0, 0, 0])
-            }
-        });
-
-        let east_face = Image::from_fn(image.width(), image.height() + image.width(), |x, y| {
-            let (x, y) = (x as i32, y as i32);
-            let (w, h) = (image.width() as i32, image.height() as i32);
-            let y = y + x - w;
-            if x >= 0 && x < w && y >= 0 && y < h {
-                *image.get_pixel(x as u32, y as u32)
-            } else {
-                Rgba([0, 0, 0, 0])
-            }
-        });
-
-        ret.push(Shape::Sprite {
-            image: south_face,
-            offset: [0, 0],
-        });
-        ret.push(Shape::Sprite {
-            image: east_face,
-            offset: [0, 0],
-        });
-
-        ret
-    }
-}
-
-pub fn load_shapes<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Vec<Shape>> {
-    let size = reader.read_u32::<LittleEndian>()? as usize;
-    let input_len = reader.seek(SeekFrom::End(0))?;
-    reader.seek(SeekFrom::Start(4))?;
-
-    let mut ret = Vec::new();
-
-    // Shape block does not start with an accurate size value, assume it's a
-    // bunch of 8x8 tiles.
-    if size != input_len as usize {
-        reader.seek(SeekFrom::Start(0))?;
-
-        for _ in 0..(input_len / 64) {
-            ret.push(load_tile(reader, palette)?);
-        }
-
-        return Ok(ret);
-    }
-
-    let mut offsets = Vec::new();
-    offsets.push(reader.read_u32::<LittleEndian>()? as u64);
-    for _ in 1..(offsets[0] - 4) / 4 {
-        offsets.push(reader.read_u32::<LittleEndian>()? as u64);
-    }
-
-    for offset in offsets {
-        reader.seek(SeekFrom::Start(offset))?;
-        ret.push(load_sprite(reader, palette)?);
-    }
-
-    Ok(ret)
-}
-
-fn load_tile<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shape> {
-    let mut image = ImageBuffer::new(8, 8);
-
-    for y in 0..8 {
-        for x in 0..8 {
-            image.put_pixel(x, y, palette[reader.read_u8()? as usize]);
-        }
-    }
-
-    Ok(Shape::Tile(image))
-}
-
-fn load_sprite<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shape> {
-    let max_x = reader.read_u16::<LittleEndian>()? as i16 + 1;
-    let min_x = -(reader.read_u16::<LittleEndian>()? as i16);
-    let min_y = -(reader.read_u16::<LittleEndian>()? as i16);
-    let max_y = reader.read_u16::<LittleEndian>()? as i16 + 1;
-
-    let mut image = ImageBuffer::new((max_x - min_x) as u32, (max_y - min_y) as u32);
-
-    let mut plot = |x, y, color| {
-        image.put_pixel(
-            (x - min_x) as u32,
-            (y - min_y) as u32,
-            palette[color as usize],
-        );
-    };
-
-    loop {
-        let data = reader.read_u16::<LittleEndian>()?;
-        if data == 0 {
-            break;
-        }
-
-        let x = reader.read_i16::<LittleEndian>()?;
-        let y = reader.read_i16::<LittleEndian>()?;
-
-        assert!(x >= min_x && x < max_x && y >= min_y && y < max_y);
-
-        let len = (data >> 1) as usize;
-        let mode = data & 1;
-
-        if mode == 0 {
-            // Raw data
-            for i in 0..len {
-                plot(x + i as i16, y, reader.read_u8()?);
-            }
-        } else {
-            // RLE data
-            let mut x2 = x;
-            while x2 < x + len as i16 {
-                let run = reader.read_u8()?;
-                let run_type = run & 1;
-                let run_len = (run >> 1) as usize;
-                if run_type == 0 {
-                    // Raw data.
-                    for _ in 0..run_len {
-                        plot(x2, y, reader.read_u8()?);
-                        x2 += 1;
-                    }
-                } else {
-                    // Repeat value
-                    let value = reader.read_u8()?;
-                    for _ in 0..run_len {
-                        plot(x2, y, value);
-                        x2 += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(Shape::Sprite {
-        image,
-        offset: [min_x as i32, min_y as i32],
-    })
-}
-
-// {{{1 utilities
-
-fn build_sheet(shapes: &[Shape], palette: &[Pixel]) -> Image {
+fn build_sheet(shapes: &[Frame], palette: &[Pixel]) -> Image {
     const COLUMNS: usize = 9;
 
     // Determine positions of images and total sheet dimensions.
@@ -786,17 +782,11 @@ fn build_sheet(shapes: &[Shape], palette: &[Pixel]) -> Image {
             y = height;
         }
 
-        let (mut w, mut h) = s.as_ref().dimensions();
+        let (mut w, mut h) = s.image.dimensions();
 
-        if matches!(s, Shape::Sprite { .. }) {
-            // It's a sprite, add padding.
-            positions.push((x + 1, y + 1));
-            w += 1;
-            h += 1;
-        } else {
-            // Pack tiles tightly.
-            positions.push((x, y));
-        }
+        positions.push((x + 1, y + 1));
+        w += 1;
+        h += 1;
 
         width = width.max(x + w);
         height = height.max(y + h);
@@ -806,7 +796,7 @@ fn build_sheet(shapes: &[Shape], palette: &[Pixel]) -> Image {
     let mut result = ImageBuffer::from_pixel(width, height, palette[255]);
 
     for (s, (x, y)) in shapes.iter().zip(positions) {
-        for (sx, sy, p) in s.as_ref().enumerate_pixels() {
+        for (sx, sy, p) in s.image.enumerate_pixels() {
             // Skip transparent pixels.
             if p.0[3] != 0 {
                 result.put_pixel(x + sx, y + sy, *p);

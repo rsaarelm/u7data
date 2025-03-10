@@ -11,7 +11,7 @@ use std::{
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::Parser;
-use glam::{ivec3, IVec2, IVec3};
+use glam::{ivec2, ivec3, IVec2, IVec3};
 use image::{ImageBuffer, Rgba};
 use itertools::Itertools;
 use serde::Deserialize;
@@ -405,7 +405,7 @@ struct U7Data {
     pub shapes: Vec<Vec<Frame>>,
     pub strings: Vec<String>,
     pub palette: Vec<Pixel>,
-    pub shape_dims: Vec<[i32; 3]>,
+    pub shape_dims: Vec<IVec3>,
 }
 
 impl U7Data {
@@ -428,7 +428,7 @@ impl U7Data {
                 let z = (f1 >> 5) & 0x7;
                 let x = (f3 & 0x7) + 1;
                 let y = ((f3 >> 3) & 0x7) + 1;
-                shape_dims.push([x as i32, y as i32, z as i32]);
+                shape_dims.push(ivec3(x as i32, y as i32, z as i32));
             }
         }
 
@@ -510,12 +510,13 @@ impl U7Data {
 pub struct Frame {
     image: Image,
     // Coordinates of bottom right corner of base in image.
-    offset: [i32; 2],
+    offset: IVec2,
     // 3D dimensions in multiples of 8 pixels.
-    dim: [i32; 3],
+    dim: IVec3,
 }
 
 impl Frame {
+    /// Load a 8x8 tile frame from the Ultima 7 graphics data.
     pub fn tile<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Self> {
         let mut image = ImageBuffer::new(8, 8);
 
@@ -527,16 +528,13 @@ impl Frame {
 
         Ok(Frame {
             image,
-            offset: [0, 0],
-            dim: [1, 1, 0],
+            offset: IVec2::ZERO,
+            dim: ivec3(1, 1, 0),
         })
     }
 
-    pub fn sprite<R: Read + Seek>(
-        reader: &mut R,
-        palette: &[Pixel],
-        dim: [i32; 3],
-    ) -> Result<Self> {
+    /// Load a sprite frame from the Ultima 7 graphics data.
+    pub fn sprite<R: Read + Seek>(reader: &mut R, palette: &[Pixel], dim: IVec3) -> Result<Self> {
         let max_x = reader.read_u16::<LittleEndian>()? as i16 + 1;
         let min_x = -(reader.read_u16::<LittleEndian>()? as i16);
         let min_y = -(reader.read_u16::<LittleEndian>()? as i16);
@@ -598,7 +596,7 @@ impl Frame {
 
         Ok(Frame {
             image,
-            offset: [min_x as i32, min_y as i32],
+            offset: ivec2(min_x as i32, min_y as i32),
             dim,
         })
     }
@@ -630,10 +628,10 @@ impl Frame {
         }
 
         // Solid-color base for footprint.
-        for y in 0..self.dim[1] * 8 {
-            for x in 0..self.dim[0] * 8 {
+        for y in 0..self.dim.y * 8 {
+            for x in 0..self.dim.x * 8 {
                 let force =
-                    (x == 0 && y == 0) || (x == self.dim[0] * 8 - 1 && y == self.dim[1] * 8 - 1);
+                    (x == 0 && y == 0) || (x == self.dim.x * 8 - 1 && y == self.dim.y * 8 - 1);
                 plot(force, -x, -y, palette[254]);
             }
         }
@@ -643,7 +641,7 @@ impl Frame {
         let mut ret = Vec::new();
 
         // Don't skew flat shapes.
-        if self.dim[2] == 0 {
+        if self.dim.z == 0 {
             return ret;
         }
 
@@ -688,12 +686,24 @@ impl Frame {
 
         ret
     }
+
+    /// Turn an east view into a south view or a west view into a north view.
+    pub fn rotate(&mut self) {
+        let mut image = ImageBuffer::new(self.image.height(), self.image.width());
+        for (x, y, p) in self.image.enumerate_pixels() {
+            image.put_pixel(y, x, *p);
+        }
+
+        self.image = image;
+        self.offset = ivec2(self.offset.y, self.offset.x);
+        self.dim = ivec3(self.dim.y, self.dim.x, self.dim.z);
+    }
 }
 
 pub fn load_frames<R: Read + Seek>(
     reader: &mut R,
     palette: &[Pixel],
-    dim: [i32; 3],
+    dim: IVec3,
 ) -> Result<Vec<Frame>> {
     let size = reader.read_u32::<LittleEndian>()? as usize;
     let input_len = reader.seek(SeekFrom::End(0))?;
@@ -827,5 +837,15 @@ fn save_indexed(image: &Image, palette: &[Pixel], path: impl AsRef<Path>) -> Res
     writer.write_image_data(&image_data)?;
     Ok(())
 }
+
+pub trait TileSpace: Into<[i32; 3]> + Copy {
+    /// Project 3D tile space coordinates into 2D screen space.
+    fn t2s(self) -> IVec2 {
+        let [x, y, z] = self.into();
+        ivec2(x * 8 - z * 4, y * 8 - z * 4)
+    }
+}
+
+impl TileSpace for IVec3 {}
 
 // vim:foldmethod=marker

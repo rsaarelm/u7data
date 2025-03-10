@@ -14,9 +14,70 @@ use itertools::Itertools;
 type Pixel = Rgba<u8>;
 type Image = ImageBuffer<Pixel, Vec<u8>>;
 
-// Clap-parsed args struct
+// Clap CLI interface spec:
+//
+// Set up an enum with multiple commands:
+//   dump: Dump out all the game graphics, with options
+//   catalog: Generate a HTML catalogue of game objects, needs IDM object
+//     as input.
+//
+//  There's a global flag u7-path that all the commands use.
+
 #[derive(Debug, Parser)]
 struct Args {
+    #[command(subcommand)]
+    pub cmd: Command,
+
+    /// Path to the game directory.
+    #[arg(long)]
+    pub u7_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+enum Command {
+    /// Generate a HTML catalogue of game objects.
+    Catalog(CatalogArgs),
+
+    /// Dump out all the game graphics.
+    Dump(DumpArgs),
+}
+
+fn main() -> Result<()> {
+    let mut args = Args::parse();
+
+    if args.u7_path.is_none() {
+        let Some(path) = env::var_os("U7_PATH") else {
+            bail!("Please specify path to the game files in '--u7-path' command-line option or the environment variable 'U7_PATH'");
+        };
+        args.u7_path = Some(PathBuf::from(path));
+    }
+    let path = args.u7_path.unwrap();
+    let data = U7Data::load(path)?;
+
+    match args.cmd {
+        Command::Dump(ref args) => dump(data, args),
+        Command::Catalog(ref args) => catalog(data, args),
+    }
+}
+
+// {{{1 Catalog builder
+
+#[derive(Debug, Parser)]
+struct CatalogArgs {
+    /// Location of the database describing all physical game objects. Use "-"
+    /// to read from stdin.
+    #[arg(default_value = "-")]
+    pub object_database: PathBuf,
+}
+
+fn catalog(_data: U7Data, _args: &CatalogArgs) -> Result<()> {
+    todo!();
+}
+
+// {{{1 Shape dumper
+
+#[derive(Debug, Parser)]
+struct DumpArgs {
     /// Path to the game directory.
     #[arg(long)]
     pub u7_path: Option<PathBuf>,
@@ -34,19 +95,7 @@ struct Args {
     pub keep_transparent_color: bool,
 }
 
-fn main() -> Result<()> {
-    let mut args = Args::parse();
-
-    if args.u7_path.is_none() {
-        let Some(path) = env::var_os("U7_PATH") else {
-            bail!("Please specify path to the game files in '--u7-path' command-line option or the environment variable 'U7_PATH'");
-        };
-        args.u7_path = Some(PathBuf::from(path));
-    }
-    let path = args.u7_path.unwrap();
-
-    let mut data = U7Data::load(path)?;
-
+fn dump(mut data: U7Data, args: &DumpArgs) -> Result<()> {
     // The orange transparent color hurts my eyes, change it to something
     // nicer.
     if !args.keep_transparent_color {
@@ -93,6 +142,8 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+// {{{1 General game data
 
 #[derive(Debug)]
 enum Game {
@@ -176,6 +227,8 @@ impl Game {
         }
     }
 }
+
+// {{{1 Graphics and object data structure reading
 
 #[derive(Debug)]
 struct U7Data {
@@ -319,6 +372,8 @@ pub fn load_flx(path: impl AsRef<Path>) -> Result<Vec<Vec<u8>>> {
     Ok(ret)
 }
 
+// {{{1 Shape type
+
 #[derive(Clone, Debug)]
 pub enum Shape {
     Sprite { image: Image, offset: [i32; 2] },
@@ -359,7 +414,8 @@ impl Shape {
             let x = x - offset[0];
             let y = y - offset[1];
             if x >= 0 && x < image.width() as i32 && y >= 0 && y < image.height() as i32 {
-                if force || image.get_pixel(x as u32, y as u32).0[3] == 0 {
+                let p = image.get_pixel(x as u32, y as u32);
+                if force || p.0[3] == 0 {
                     image.put_pixel(x as u32, y as u32, color);
                 }
             }
@@ -535,6 +591,8 @@ fn load_sprite<R: Read + Seek>(reader: &mut R, palette: &[Pixel]) -> Result<Shap
     })
 }
 
+// {{{1 utilities
+
 fn build_sheet(shapes: &[Shape], palette: &[Pixel]) -> Image {
     const COLUMNS: usize = 9;
 
@@ -601,3 +659,5 @@ fn save_indexed(image: &Image, palette: &[Pixel], path: impl AsRef<Path>) -> Res
     writer.write_image_data(&image_data)?;
     Ok(())
 }
+
+// vim:foldmethod=marker

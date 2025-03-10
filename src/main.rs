@@ -67,7 +67,12 @@ struct CatalogArgs {
     pub object_database: PathBuf,
 }
 
-fn catalog(data: U7Data, args: &CatalogArgs) -> Result<()> {
+fn catalog(mut data: U7Data, args: &CatalogArgs) -> Result<()> {
+    use Facing::*;
+
+    // Nice transparent color.
+    data.palette[255] = Rgba([0, 255, 255, 0]);
+
     // Read object database from args.
     let db: String = if args.object_database == PathBuf::from("-") {
         let mut buf = String::new();
@@ -88,29 +93,97 @@ fn catalog(data: U7Data, args: &CatalogArgs) -> Result<()> {
     )?;
 
     for (name, views) in db {
-        // Look for default face
-        let face_frame = if let Some(view) = views.get(&Facing::South.into()) {
-            view.frames.first().unwrap()
-        } else if let Some(view) = views.get(&Facing::East.into()) {
-            view.frames.first().unwrap()
-        } else if let Some(view) = views.get(&Facing::North.into()) {
-            // Sometimes we have just the backside...
-            view.frames.first().unwrap()
-        } else if let Some(view) = views.get(&Facing::West.into()) {
-            view.frames.first().unwrap()
-        } else {
-            bail!("No default view for object {name}");
-        };
+        // Filter out empty frames from views
+        let views = views
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    View {
+                        frames: v
+                            .frames
+                            .into_iter()
+                            .filter(|f| {
+                                data.shapes[f.shape].len() > f.frame
+                                    && !data.shapes[f.shape][f.frame].is_empty()
+                            })
+                            .collect(),
+                        ..v
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
-        eprintln!("{name}");
-        let shape = &data.shapes[face_frame.shape][face_frame.frame];
-        if shape.is_empty() {
-            bail!("Empty default view for object {name}");
+        // Object is built from multiple shapes and we need to reassemble it.
+        let is_composite = views.iter().any(|(k, _)| k.extension != IVec3::ZERO);
+
+        let mut north_frames = Vec::new();
+        let mut south_frames = Vec::new();
+
+        if is_composite {
+            for face in [North, West, South, East] {
+                let mut frames = Vec::new();
+                for (k, v) in &views {
+                    if k.facing == face && !v.frames.is_empty() {
+                        // XXX: I'll be ignoring animations with composite
+                        // objects and just drawing the first frame for now.
+                        let f = v.frames[0];
+                        let mut f = data.shapes[f.shape][f.frame].clone();
+                        f.offset -= v.offset;
+                        frames.push((k.extension, f));
+                    }
+                }
+
+                if !frames.is_empty() {
+                    let mut frame = Frame::compose(&data.palette, frames.into_iter());
+                    match face {
+                        North => north_frames.push(frame),
+                        West => {
+                            frame.rotate();
+                            north_frames.push(frame);
+                        }
+                        South => south_frames.push(frame),
+                        East => {
+                            frame.rotate();
+                            south_frames.push(frame);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (k, v) in &views {
+                for f in &v.frames {
+                    let mut frame = data.shapes[f.shape][f.frame].clone();
+                    frame.offset -= v.offset;
+                    match k.facing {
+                        North => north_frames.push(frame),
+                        West => {
+                            frame.rotate();
+                            north_frames.push(frame);
+                        }
+                        South => south_frames.push(frame),
+                        East => {
+                            frame.rotate();
+                            south_frames.push(frame);
+                        }
+                    }
+                }
+            }
         }
+
+        if north_frames.is_empty() && south_frames.is_empty() {
+            bail!("No views for object {name}");
+        }
+
+        let main_shape = if south_frames.is_empty() {
+            &north_frames[0]
+        } else {
+            &south_frames[0]
+        };
 
         // Save shape as "{name}.png"
         let filename = format!("{name}.png");
-        save_indexed(&shape.image, &data.palette, &filename)?;
+        save_indexed(&main_shape.image, &data.palette, &filename)?;
 
         writeln!(
             html,
@@ -405,7 +478,6 @@ struct U7Data {
     pub shapes: Vec<Vec<Frame>>,
     pub strings: Vec<String>,
     pub palette: Vec<Pixel>,
-    pub shape_dims: Vec<IVec3>,
 }
 
 impl U7Data {
@@ -475,7 +547,6 @@ impl U7Data {
             shapes,
             strings,
             palette,
-            shape_dims,
         })
     }
 
@@ -506,7 +577,7 @@ impl U7Data {
 
 // {{{1 Frame type
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub struct Frame {
     image: Image,
     // Coordinates of bottom right corner of base in image.
@@ -540,7 +611,11 @@ impl Frame {
         let min_y = -(reader.read_u16::<LittleEndian>()? as i16);
         let max_y = reader.read_u16::<LittleEndian>()? as i16 + 1;
 
-        let mut image = ImageBuffer::new((max_x - min_x) as u32, (max_y - min_y) as u32);
+        let mut image = ImageBuffer::from_pixel(
+            (max_x - min_x) as u32,
+            (max_y - min_y) as u32,
+            Rgba([0, 255, 255, 0]),
+        );
 
         let mut plot = |x, y, color| {
             image.put_pixel(
@@ -601,8 +676,88 @@ impl Frame {
         })
     }
 
+    /// Construct a composite frame out of multiple sub-frames. The input
+    /// contains 3D offsets in multiples of 8 pixels (z axis maps to (-4, -4)
+    /// in x, y). The order of inputs is unspecified, so the function must
+    /// collect the input first and then determine the correct draw order.
+    pub fn compose(palette: &[Pixel], input: impl Iterator<Item = (IVec3, Frame)>) -> Self {
+        // TODO: Figure out if all this stuff actually works correctly...
+        let mut frames: Vec<(IVec3, Frame)> = input.collect();
+
+        if frames.is_empty() {
+            return Default::default();
+        }
+
+        // Project upper corner of the object on the view screen's normal
+        // vector, sort by that. Hope that's good enough.
+        frames.sort_by_key(|(t, frame)| {
+            // Offset point is at the lower right corner of the bounding box
+            // so x and y don't need to be adjusted by dim.
+            let (x, y, z) = (t.x, t.y, t.z + frame.dim[2]);
+            x + y + z
+        });
+
+        // Establish composite image dimensions.
+        let mut min = IVec2::splat(i32::MAX);
+        let mut max = IVec2::splat(i32::MIN);
+
+        // Combined tile space bounding box.
+        let mut t_min = IVec3::splat(i32::MAX);
+        let mut t_max = IVec3::splat(i32::MAX);
+
+        let mut new_offset = IVec2::splat(i32::MIN);
+
+        for (pos, frame) in &frames {
+            let (a, b) = frame.corners();
+            min = min.min(a + pos.t2s());
+            max = max.max(b + pos.t2s());
+
+            new_offset = new_offset.max(pos.t2s());
+
+            t_min = t_min.min(*pos);
+            t_max = t_max.max(*pos + frame.dim);
+        }
+
+        let mut canvas =
+            ImageBuffer::from_pixel((max.x - min.x) as u32, (max.y - min.y) as u32, palette[255]);
+
+        for (pos, frame) in frames {
+            frame.draw(&mut canvas, pos.t2s() - min);
+        }
+
+        Frame {
+            image: canvas,
+            offset: new_offset,
+            dim: t_max - t_min,
+        }
+    }
+
+    /// Return true if the frame has no visible pixels.
     pub fn is_empty(&self) -> bool {
         self.image.enumerate_pixels().all(|(_, _, p)| p.0[3] == 0)
+    }
+
+    /// Get upper left and lower right corners of the frame.
+    pub fn corners(&self) -> (IVec2, IVec2) {
+        let min = self.offset;
+        let max = min + ivec2(self.image.width() as i32, self.image.height() as i32);
+        (min, max)
+    }
+
+    /// Draw this frame on another image.
+    pub fn draw(&self, canvas: &mut Image, pos: IVec2) {
+        for (x, y, p) in self.image.enumerate_pixels() {
+            let x = x as i32 + pos.x + self.offset.x;
+            let y = y as i32 + pos.y + self.offset.y;
+            if p.0[3] != 0
+                && x >= 0
+                && x < canvas.width() as i32
+                && y >= 0
+                && y < canvas.height() as i32
+            {
+                canvas.put_pixel(x as u32, y as u32, *p);
+            }
+        }
     }
 
     /// Draw a bounding box behind the frame based on the dimensions.
@@ -697,6 +852,18 @@ impl Frame {
         self.image = image;
         self.offset = ivec2(self.offset.y, self.offset.x);
         self.dim = ivec3(self.dim.y, self.dim.x, self.dim.z);
+    }
+}
+
+impl fmt::Debug for Frame {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Frame {{ image_size: {:?}, dim: {:?}, offset: {:?} }}",
+            self.image.dimensions(),
+            self.dim,
+            self.offset
+        )
     }
 }
 
@@ -836,6 +1003,23 @@ fn save_indexed(image: &Image, palette: &[Pixel], path: impl AsRef<Path>) -> Res
     let mut writer = encoder.write_header()?;
     writer.write_image_data(&image_data)?;
     Ok(())
+}
+
+fn make_gif_animation(frames: &[Frame]) -> Result<Vec<u8>> {
+    // Figure out the bounds of the animation frame, the max bounds from all
+    // frames.
+    //
+    // All frames must by drawn centered on their offset.
+
+    let mut min = IVec2::splat(i32::MAX);
+    let mut max = IVec2::splat(i32::MIN);
+    for f in frames {
+        let (a, b) = f.corners();
+        min = min.min(a);
+        max = max.max(b);
+    }
+
+    todo!()
 }
 
 pub trait TileSpace: Into<[i32; 3]> + Copy {

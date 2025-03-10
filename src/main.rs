@@ -1,15 +1,21 @@
 use std::{
+    collections::BTreeMap,
     env,
+    fmt::{self, Write},
     fs::File,
     io::{prelude::*, Cursor, SeekFrom},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use anyhow::{bail, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::Parser;
+use glam::{ivec3, IVec2, IVec3};
 use image::{ImageBuffer, Rgba};
 use itertools::Itertools;
+use serde::Deserialize;
+use serde_with::DeserializeFromStr;
 
 type Pixel = Rgba<u8>;
 type Image = ImageBuffer<Pixel, Vec<u8>>;
@@ -70,8 +76,180 @@ struct CatalogArgs {
     pub object_database: PathBuf,
 }
 
-fn catalog(_data: U7Data, _args: &CatalogArgs) -> Result<()> {
-    todo!();
+fn catalog(data: U7Data, args: &CatalogArgs) -> Result<()> {
+    // Read object database from args.
+    let db: String = if args.object_database == PathBuf::from("-") {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(&args.object_database)?
+    };
+
+    let db: BTreeMap<String, BTreeMap<ViewKey, View>> = idm::from_str(&db)?;
+
+    // Crummiest possible initial catalog...
+    let mut html = String::new();
+    // XXX: Askama templates would be nicer than spewing out raw HTML.
+    writeln!(
+        html,
+        "<html><head><title>Ultima 7 Object Catalog</title></head><body><ul>"
+    )?;
+
+    for (name, views) in db {
+        // Look for default face
+        let face_frame = if let Some(view) = views.get(&Facing::South.into()) {
+            view.frames.first().unwrap()
+        } else if let Some(view) = views.get(&Facing::East.into()) {
+            view.frames.first().unwrap()
+        } else if let Some(view) = views.get(&Facing::North.into()) {
+            // Sometimes we have just the backside...
+            view.frames.first().unwrap()
+        } else if let Some(view) = views.get(&Facing::West.into()) {
+            view.frames.first().unwrap()
+        } else {
+            bail!("No default view for object {name}");
+        };
+
+        eprintln!("{name}");
+        let shape = &data.shapes[face_frame.shape][face_frame.frame];
+        if shape.is_empty() {
+            bail!("Empty default view for object {name}");
+        }
+
+        // Save shape as "{name}.png"
+        let filename = format!("{name}.png");
+        save_indexed(shape.as_ref(), &data.palette, &filename)?;
+
+        writeln!(
+            html,
+            "<li><img src='{filename}' alt='{name}'/> {name} </li>",
+        )?;
+    }
+
+    writeln!(html, "</ul/></body></html>")?;
+
+    // Write html to "index.html".
+    std::fs::write("index.html", html)?;
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct View {
+    #[serde(default)]
+    pub offset: IVec2,
+    pub frames: Vec<FrameIdx>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, DeserializeFromStr)]
+enum Facing {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl FromStr for Facing {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Facing> {
+        match s {
+            "north" => Ok(Facing::North),
+            "east" => Ok(Facing::East),
+            "south" => Ok(Facing::South),
+            "west" => Ok(Facing::West),
+            _ => Err(anyhow::anyhow!("invalid facing")),
+        }
+    }
+}
+
+impl fmt::Display for Facing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Facing::North => write!(f, "north"),
+            Facing::East => write!(f, "east"),
+            Facing::South => write!(f, "south"),
+            Facing::West => write!(f, "west"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, DeserializeFromStr)]
+struct ViewKey {
+    pub facing: Facing,
+    pub extension: IVec3,
+}
+
+impl From<Facing> for ViewKey {
+    fn from(facing: Facing) -> Self {
+        ViewKey {
+            facing,
+            extension: IVec3::ZERO,
+        }
+    }
+}
+
+impl Ord for ViewKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let a = (self.facing, self.extension.to_array());
+        let b = (other.facing, other.extension.to_array());
+        a.cmp(&b)
+    }
+}
+
+impl PartialOrd for ViewKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl FromStr for ViewKey {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<ViewKey> {
+        let parts = s.split_whitespace().collect::<Vec<_>>();
+        match parts.len() {
+            // Just a name, assume extension is zero.
+            1 => Ok(ViewKey {
+                facing: parts[0].parse()?,
+                extension: IVec3::ZERO,
+            }),
+            // Name and x y extension.
+            3 => Ok(ViewKey {
+                facing: parts[0].parse()?,
+                extension: ivec3(parts[1].parse()?, parts[2].parse()?, 0),
+            }),
+            // Name and x y z extension.
+            4 => Ok(ViewKey {
+                facing: parts[0].parse()?,
+                extension: ivec3(parts[1].parse()?, parts[2].parse()?, parts[3].parse()?),
+            }),
+            _ => Err(anyhow::anyhow!("invalid view key format")),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, DeserializeFromStr)]
+struct FrameIdx {
+    pub shape: usize,
+    pub frame: usize,
+}
+
+impl FromStr for FrameIdx {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<FrameIdx> {
+        // Turn "312:16" into FrameIdx { shape: 312, frame: 16 }
+        let parts = s.split(':').collect::<Vec<_>>();
+        match parts[..] {
+            [a, b] => Ok(FrameIdx {
+                shape: a.parse()?,
+                frame: b.parse()?,
+            }),
+            _ => Err(anyhow::anyhow!("invalid frame index format {s:?}")),
+        }
+    }
 }
 
 // {{{1 Shape dumper

@@ -1,3 +1,5 @@
+#!/usr/bin/env rust-script
+
 use std::{
     collections::BTreeMap,
     env,
@@ -84,14 +86,10 @@ fn catalog(mut data: U7Data, args: &CatalogArgs) -> Result<()> {
 
     let db: BTreeMap<Natural, BTreeMap<ViewKey, View>> = idm::from_str(&db)?;
 
-    // Crummiest possible initial catalog...
-    let mut html = String::new();
-    // XXX: Askama templates would be nicer than spewing out raw HTML.
-    writeln!(
-        html,
-        "<html><head><title>Ultima 7 Object Catalog</title></head><body><ul>"
-    )?;
+    // Put images in a subdirectory.
+    std::fs::create_dir_all("img")?;
 
+    let mut entries = Vec::new();
     for (name, views) in db {
         // The Natural wrapper has served is purpose controlling the BTreeMap
         // order.
@@ -126,30 +124,42 @@ fn catalog(mut data: U7Data, args: &CatalogArgs) -> Result<()> {
 
         if is_composite {
             for face in [North, West, South, East] {
-                let mut frames = Vec::new();
-                for (k, v) in &views {
-                    if k.facing == face && !v.frames.is_empty() {
-                        // XXX: I'll be ignoring animations with composite
-                        // objects and just drawing the first frame for now.
-                        let f = v.frames[0];
-                        let mut f = data.shapes[f.shape][f.frame].clone();
-                        f.offset -= v.offset;
-                        frames.push((k.extension, f));
-                    }
-                }
+                // Run animation from the longest running sprite and cycle the
+                // shroter ones alongside it. Don't try to do cute stuff like
+                // running the animation up to the greatest common divisor so
+                // that none of the animations will be cut because we want to
+                // keep the gif files small.
+                let anim_length = views
+                    .iter()
+                    .filter(|(k, _)| k.facing == face)
+                    .map(|(_, v)| v.frames.len())
+                    .max()
+                    .unwrap_or(0);
 
-                if !frames.is_empty() {
-                    let mut frame = Frame::compose(&data.palette, frames.into_iter());
-                    match face {
-                        North => north_frames.push(frame),
-                        West => {
-                            frame.rotate();
-                            north_frames.push(frame);
+                for anim_frame in 0..anim_length {
+                    let mut frames = Vec::new();
+                    for (k, v) in &views {
+                        if k.facing == face && !v.frames.is_empty() {
+                            let f = v.frames[anim_frame % v.frames.len()];
+                            let mut f = data.shapes[f.shape][f.frame].clone();
+                            f.offset -= v.offset;
+                            frames.push((k.extension, f));
                         }
-                        South => south_frames.push(frame),
-                        East => {
-                            frame.rotate();
-                            south_frames.push(frame);
+                    }
+
+                    if !frames.is_empty() {
+                        let mut frame = Frame::compose(&data.palette, frames.into_iter());
+                        match face {
+                            North => north_frames.push(frame),
+                            West => {
+                                frame.rotate();
+                                north_frames.push(frame);
+                            }
+                            South => south_frames.push(frame),
+                            East => {
+                                frame.rotate();
+                                south_frames.push(frame);
+                            }
                         }
                     }
                 }
@@ -185,20 +195,66 @@ fn catalog(mut data: U7Data, args: &CatalogArgs) -> Result<()> {
             &south_frames[0]
         };
 
-        // Save shape as "{name}.png"
-        let filename = format!("{name}.png");
-        save_indexed(&main_shape.image, &data.palette, &filename)?;
+        let filename = format!("img/{name}.png");
+        save_indexed(&data.palette, &filename, &main_shape.image)?;
 
-        writeln!(
-            html,
-            "<li><img src='{filename}' alt='{name}'/> {name} </li>",
-        )?;
+        // Save animations.
+        if !south_frames.is_empty() {
+            save_gif_animation(
+                &data.palette,
+                format!("img/{name}_south.gif"),
+                &south_frames,
+            )?;
+        }
+
+        if !north_frames.is_empty() {
+            save_gif_animation(
+                &data.palette,
+                format!("img/{name}_north.gif"),
+                &north_frames,
+            )?;
+        }
+
+        entries.push((name, !south_frames.is_empty(), !north_frames.is_empty()));
     }
 
-    writeln!(html, "</ul/></body></html>")?;
+    // Build HTML pages from entries.
+    const ITEMS_PER_PAGE: usize = 256;
 
-    // Write html to "index.html".
-    std::fs::write("index.html", html)?;
+    for i in 0..entries.len().div_ceil(ITEMS_PER_PAGE) {
+        let mut html = String::new();
+        writeln!(
+            html,
+            "<html><head><title>Ultima 7 Object Catalog {i}</title></head><body><ul>"
+        )?;
+
+        for (name, has_south, has_north) in
+            &entries[i * ITEMS_PER_PAGE..(i * ITEMS_PER_PAGE + ITEMS_PER_PAGE).min(entries.len())]
+        {
+            let filename = format!("{name}.png");
+            writeln!(html, "<li><img src='img/{filename}' alt='{name}'/>",)?;
+
+            if *has_south {
+                writeln!(
+                    html,
+                    " <img src='img/{name}_south.gif' alt='{name}_south'/>",
+                )?;
+            }
+
+            if *has_north {
+                writeln!(
+                    html,
+                    " <img src='img/{name}_north.gif' alt='{name}_north'/>",
+                )?;
+            }
+
+            writeln!(html, " {name} </li>",)?;
+        }
+
+        writeln!(html, "</ul/></body></html>")?;
+
+        std::fs::write(format!("{i:02}.html"), html)?;
+    }
 
     Ok(())
 }
@@ -354,7 +410,7 @@ fn dump(mut data: U7Data, args: &DumpArgs) -> Result<()> {
         let idx = (y / PALETTE_SCALE) * 16 + (x / PALETTE_SCALE);
         data.palette[idx as usize]
     });
-    save_indexed(&palette_img, &data.palette, "palette.png")?;
+    save_indexed(&data.palette, "palette.png", &palette_img)?;
 
     // Decorate shapes with geometry info and save as sprite sheets.
     for (i, ss) in data.shapes.iter().enumerate() {
@@ -384,7 +440,7 @@ fn dump(mut data: U7Data, args: &DumpArgs) -> Result<()> {
             continue;
         }
         let sheet = build_sheet(&shapes, &data.palette);
-        save_indexed(&sheet, &data.palette, filename)?;
+        save_indexed(&data.palette, filename, &sheet)?;
     }
     Ok(())
 }
@@ -709,14 +765,10 @@ impl Frame {
         let mut t_min = IVec3::splat(i32::MAX);
         let mut t_max = IVec3::splat(i32::MAX);
 
-        let mut new_offset = IVec2::splat(i32::MIN);
-
         for (pos, frame) in &frames {
             let (a, b) = frame.corners();
             min = min.min(a + pos.t2s());
             max = max.max(b + pos.t2s());
-
-            new_offset = new_offset.max(pos.t2s());
 
             t_min = t_min.min(*pos);
             t_max = t_max.max(*pos + frame.dim);
@@ -731,7 +783,7 @@ impl Frame {
 
         Frame {
             image: canvas,
-            offset: new_offset,
+            offset: min,
             dim: t_max - t_min,
         }
     }
@@ -988,46 +1040,104 @@ fn build_sheet(shapes: &[Frame], palette: &[Pixel]) -> Image {
     result
 }
 
-fn save_indexed(image: &Image, palette: &[Pixel], path: impl AsRef<Path>) -> Result<()> {
+fn save_indexed(palette: &[Pixel], path: impl AsRef<Path>, image: &Image) -> Result<()> {
     let image_data: Vec<u8> = image
         .pixels()
         .map(|p| palette.iter().position(|c| c == p).unwrap_or(0) as u8)
-        .collect();
-
-    let palette_data: Vec<u8> = palette
-        .iter()
-        .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
         .collect();
 
     let mut writer = File::create(path)?;
     let mut encoder = png::Encoder::new(&mut writer, image.width(), image.height());
     encoder.set_color(png::ColorType::Indexed);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_palette(&palette_data);
+    encoder.set_palette(palette_bytes(palette));
     let mut writer = encoder.write_header()?;
     writer.write_image_data(&image_data)?;
     Ok(())
 }
 
-fn make_gif_animation(frames: &[Frame]) -> Result<Vec<u8>> {
+fn save_gif_animation(palette: &[Pixel], path: impl AsRef<Path>, frames: &[Frame]) -> Result<()> {
     // Figure out the bounds of the animation frame, the max bounds from all
     // frames.
     //
     // All frames must by drawn centered on their offset.
 
-    let mut min = IVec2::splat(i32::MAX);
-    let mut max = IVec2::splat(i32::MIN);
-    for f in frames {
-        let (a, b) = f.corners();
-        min = min.min(a);
-        max = max.max(b);
+    let (mut min, mut max) = frames
+        .iter()
+        .map(Frame::corners)
+        .reduce(extents)
+        .expect("save_gif_animation: Empty frame list");
+
+    // Add padding
+    min -= 2;
+    max += 2;
+
+    // Generate a checkerboard pattern of 20 pixel squares that correspond to
+    // 1 meter in model scale. Put the cross-point at coordinate system origin
+    // so you can check if the object is properly aliged in the data (symmetry
+    // planes should align with origin).
+    let base = ImageBuffer::from_fn((max - min).x as u32, (max - min).y as u32, |x, y| {
+        // Adjust origin to the center of the object's bounding box.
+        let x = x as i32 + min.x + frames[0].dim.x * 4;
+        let y = y as i32 + min.y + frames[0].dim.y * 4;
+        if (x.div_euclid(20) + y.div_euclid(20)) % 2 == 0 {
+            // white
+            palette[248]
+        } else {
+            // Alternate color across x and y axes so you can tell where the
+            // origin is on the checkerboard.
+            if (x >= 0 && y >= 0) || (x < 0 && y < 0) {
+                // magenta
+                palette[244]
+            } else {
+                // cyan
+                palette[255]
+            }
+        }
+    });
+
+    let frames: Vec<_> = frames
+        .iter()
+        .map(|f| {
+            let mut frame = base.clone();
+            f.draw(&mut frame, -min);
+            frame
+        })
+        .collect();
+
+    let mut buffer = Vec::new();
+    {
+        // Generate a gif animation from `frames` with 200ms frame delay that
+        // loops forever.
+        let mut encoder = gif::Encoder::new(
+            &mut buffer,
+            base.width() as u16,
+            base.height() as u16,
+            &palette_bytes(palette),
+        )?;
+        encoder.set_repeat(gif::Repeat::Infinite)?;
+        for frame in frames {
+            let mut frame = gif::Frame::from_indexed_pixels(
+                base.width() as u16,
+                base.height() as u16,
+                frame
+                    .pixels()
+                    .map(|p| palette.iter().position(|c| c == p).unwrap_or(0) as u8)
+                    .collect::<Vec<_>>(),
+                None,
+            );
+            // Run at 5 FPS.
+            frame.delay = 20;
+            encoder.write_frame(&frame)?;
+        }
     }
 
-    todo!()
+    std::fs::write(path, buffer)?;
+    Ok(())
 }
 
 pub trait TileSpace: Into<[i32; 3]> + Copy {
-    /// Project 3D tile space coordinates into 2D screen space.
+    /// Project 3D tile space coordinates into 2D pixel screen space.
     fn t2s(self) -> IVec2 {
         let [x, y, z] = self.into();
         ivec2(x * 8 - z * 4, y * 8 - z * 4)
@@ -1050,6 +1160,18 @@ impl PartialOrd for Natural {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Return smallest rectangle containing both argument rectangles.
+fn extents((a1, a2): (IVec2, IVec2), (b1, b2): (IVec2, IVec2)) -> (IVec2, IVec2) {
+    (a1.min(b1), a2.max(b2))
+}
+
+fn palette_bytes(palette: &[Pixel]) -> Vec<u8> {
+    palette
+        .iter()
+        .flat_map(|p| [p.0[0], p.0[1], p.0[2]])
+        .collect()
 }
 
 // vim:foldmethod=marker

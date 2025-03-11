@@ -37,8 +37,11 @@ enum Command {
     /// Generate a HTML catalogue of game objects.
     Catalog(CatalogArgs),
 
+    // Dump out game objects
+    DumpObjects,
+
     /// Dump out all the game graphics.
-    Dump(DumpArgs),
+    DumpSprites(SpriteArgs),
 }
 
 fn main() -> Result<()> {
@@ -54,8 +57,15 @@ fn main() -> Result<()> {
     let data = U7Data::load(path)?;
 
     match args.cmd {
-        Command::Dump(ref args) => dump(data, args),
         Command::Catalog(ref args) => catalog(data, args),
+        Command::DumpObjects => {
+            for (k, (s, f)) in &data.objects {
+                println!("{k}: {s}:{f}  -- {}", data.shape_name(*s));
+            }
+
+            Ok(())
+        }
+        Command::DumpSprites(ref args) => dump_sprites(data, args),
     }
 }
 
@@ -379,7 +389,7 @@ impl FromStr for FrameIdx {
 // {{{1 Shape dumper
 
 #[derive(Debug, Parser)]
-struct DumpArgs {
+struct SpriteArgs {
     /// Path to the game directory.
     #[arg(long)]
     pub u7_path: Option<PathBuf>,
@@ -397,7 +407,7 @@ struct DumpArgs {
     pub keep_transparent_color: bool,
 }
 
-fn dump(mut data: U7Data, args: &DumpArgs) -> Result<()> {
+fn dump_sprites(mut data: U7Data, args: &SpriteArgs) -> Result<()> {
     // The orange transparent color hurts my eyes, change it to something
     // nicer.
     if !args.keep_transparent_color {
@@ -538,6 +548,7 @@ struct U7Data {
     pub shapes: Vec<Vec<Frame>>,
     pub strings: Vec<String>,
     pub palette: Vec<Pixel>,
+    pub objects: Vec<(IVec3, (usize, usize))>,
 }
 
 impl U7Data {
@@ -602,11 +613,91 @@ impl U7Data {
             shapes.push(frames);
         }
 
+        let mut objects = Vec::new();
+
+        // Read U7IFIX* files
+        for (reg_x, reg_y, path) in std::fs::read_dir(path.join("STATIC"))?
+            .filter_map(Result::ok)
+            .filter_map(|e| match e.file_name().to_str() {
+                Some(s) if s.starts_with("U7IREG") => {
+                    let n = i32::from_str_radix(&s[6..8], 16).unwrap();
+                    Some((n % 12, n / 12, e.path().to_owned()))
+                }
+                _ => None,
+            })
+        {
+            for (i, elt) in load_flx(&path)?.iter().enumerate() {
+                let (chunk_x, chunk_y) = (i as i32 % 16, i as i32 / 16);
+
+                // 1st byte is 4-bit x and 4-bit y
+                // 2nd byte is 4-bit z and zero bits
+                // 3rd and 4th byte are 10-bit shape index and 5-bit
+                // frame index
+                let mut reader = Cursor::new(elt);
+                loop {
+                    let Ok(xy) = reader.read_u8() else { break };
+                    let Ok(z0) = reader.read_u8() else { break };
+                    let Ok(sf) = reader.read_u16::<LittleEndian>() else {
+                        break;
+                    };
+
+                    let x = xy & 0xf;
+                    let y = xy >> 4;
+                    let z = (z0 & 0xf) as i32;
+                    let shape = (sf & 0x3ff) as usize;
+                    let frame = (sf >> 10) as usize;
+
+                    let (x, y) = (
+                        reg_x * 256 + chunk_x * 16 + x as i32,
+                        reg_y * 256 + chunk_y * 16 + y as i32,
+                    );
+
+                    objects.push((ivec3(x, y, z), (shape, frame)));
+                }
+            }
+        }
+
+        // Read U7IREG* files
+        for (reg_x, reg_y, path) in std::fs::read_dir(path.join("GAMEDAT"))?
+            .filter_map(Result::ok)
+            .filter_map(|e| match e.file_name().to_str() {
+                Some(s) if s.starts_with("U7IREG") => {
+                    let n = i32::from_str_radix(&s[6..8], 16).unwrap();
+                    Some((n % 12, n / 12, e.path().to_owned()))
+                }
+                _ => None,
+            })
+        {
+            // Read file `path` to memory
+            let data = std::fs::read(&path)?;
+
+            let mut reader = Cursor::new(data);
+            // Read through the entries in data
+            loop {
+                let Ok(len) = reader.read_u8() else { break };
+                if len == 6 {
+                    let x = reader.read_u8()? as i32 + reg_x * 256;
+                    let y = reader.read_u8()? as i32 + reg_y * 256;
+
+                    let sf = reader.read_u16::<LittleEndian>()?;
+                    let shape = (sf & 0x3ff) as usize;
+                    let frame = (sf >> 10) as usize;
+                    let z = reader.read_u8()? as i32 >> 4;
+
+                    objects.push((ivec3(x, y, z), (shape, frame)));
+                } else {
+                    // skip len bytes, not something we want.
+                    reader.seek(SeekFrom::Current(len as i64))?;
+                }
+            }
+        }
+
         Ok(U7Data {
             game,
             shapes,
             strings,
             palette,
+            objects,
         })
     }
 

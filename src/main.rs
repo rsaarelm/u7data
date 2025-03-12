@@ -39,6 +39,9 @@ enum Command {
 
     /// Dump out all the game graphics.
     Dump(DumpArgs),
+
+    /// Print out sizes of all shapes.
+    Sizes,
 }
 
 fn main() -> Result<()> {
@@ -56,6 +59,22 @@ fn main() -> Result<()> {
     match args.cmd {
         Command::Dump(ref args) => dump(data, args),
         Command::Catalog(ref args) => catalog(data, args),
+        Command::Sizes => {
+            for (i, s) in data.shapes.iter().enumerate() {
+                if s.is_empty() {
+                    continue;
+                }
+                let f = &s[0];
+                println!(
+                    "{i} {} {} {}  # {}",
+                    f.dim.x,
+                    f.dim.y,
+                    f.dim.z,
+                    data.shape_name(i)
+                );
+            }
+            Ok(())
+        }
     }
 }
 
